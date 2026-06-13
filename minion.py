@@ -18,8 +18,11 @@ import json
 import os
 import random
 import re
+import select
+import shutil
 import subprocess
 import sys
+import termios
 import threading
 import time
 
@@ -520,6 +523,275 @@ def model_turn(messages):
     return False
 
 
+# --- multi-line chatbox input ---------------------------------------------
+# Replaces the bare `input()` prompt with a framed, multi-line editor:
+#   • Enter submits, Alt+Enter (or Ctrl+J) inserts a newline
+#   • Paste (bracketed-paste mode) inserts its text verbatim — newlines stay,
+#     a trailing newline at the end of paste is stripped so pasting never
+#     accidentally submits
+#   • Up/Down navigate history, Left/Right move within the current line,
+#     Home/End jump to line start/end, Ctrl+U clears the line, Ctrl+C cancels
+#   • Long lines word-wrap visually inside the box; the buffer stays one
+#     logical string (newlines preserved) so the model sees the real text
+# Falls back to plain `input()` when stdin/stdout is not a TTY.
+
+def _chatbox_fallback(prompt):
+    """Plain `input()` fallback used when raw terminal mode isn't usable. Single-line only;
+    newlines must be typed as the literal `\\n` (rare in practice)."""
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        raise
+
+
+def _raw_read_key(fd):
+    return os.read(fd, 1).decode("utf-8", "replace")
+
+
+def _raw_read_available(fd, timeout=0.02):
+    parts = []
+    while True:
+        ready, _, _ = select.select([fd], [], [], timeout)
+        if not ready:
+            break
+        parts.append(os.read(fd, 1).decode("utf-8", "replace"))
+        timeout = 0
+    return "".join(parts)
+
+
+def _chatbox_raw(initial="", history=None):
+    """Normal-scrollback multi-line editor.
+
+    This does not enter the alternate screen. The prompt, streamed model output,
+    tool confirmations, and the next prompt all stay in one terminal mode, which
+    avoids garbling the REPL after submit.
+    """
+    history = history or []
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    new = old[:]
+    new[3] &= ~(termios.ECHO | termios.ICANON)
+    new[0] &= ~termios.ICRNL
+    new[6][termios.VMIN] = 1
+    new[6][termios.VTIME] = 0
+
+    buf = initial.split("\n") if initial else [""]
+    row, col = len(buf) - 1, len(buf[-1])
+    h_idx = len(history)
+    rendered_lines = 0
+    cursor_line = 0
+
+    def move_up(n):
+        return f"\x1b[{n}A" if n > 0 else ""
+
+    def move_down(n):
+        return f"\x1b[{n}B" if n > 0 else ""
+
+    def move_right(n):
+        return f"\x1b[{n}C" if n > 0 else ""
+
+    def build_visual(inner_w):
+        visual = []
+        for bi, line in enumerate(buf):
+            if not line:
+                visual.append((bi, 0, ""))
+                continue
+            for start in range(0, len(line), inner_w):
+                visual.append((bi, start, line[start:start + inner_w]))
+            if col == len(line) and row == bi and len(line) % inner_w == 0:
+                visual.append((bi, len(line), ""))
+        return visual
+
+    def render():
+        nonlocal rendered_lines, cursor_line
+        width = shutil.get_terminal_size((80, 24)).columns
+        box_w = max(20, min(width - 2, 100))
+        inner_w = max(1, box_w - 2)
+        visual = build_visual(inner_w)
+
+        cur_vrow = 0
+        cur_vcol = 0
+        for i, (bi, start, seg) in enumerate(visual):
+            if bi != row:
+                continue
+            if start <= col <= start + len(seg):
+                cur_vrow = i
+                cur_vcol = col - start
+                break
+
+        hints = "Enter send · Alt+Enter / ^J newline · ^C cancel"
+        max_hints = max(0, box_w - 11)
+        if len(hints) > max_hints:
+            hints = hints[:max_hints - 1] + "…" if max_hints > 1 else "…"
+        top_fill = max(0, box_w - 11 - len(hints))
+        stats = f"{len(buf)} line{'s' if len(buf) != 1 else ''} · {sum(len(l) for l in buf)} chars"
+        max_stats = max(0, box_w - 6)
+        if len(stats) > max_stats:
+            stats = stats[:max_stats - 1] + "…" if max_stats > 1 else "…"
+        bot_fill = max(0, box_w - 4 - len(stats))
+
+        lines = [
+            f"{DIM}╭─ {RESET}{CYAN}you{RESET}{DIM} · {hints} {'─' * top_fill}╮{RESET}",
+            *[f"{DIM}│{RESET}{seg:<{inner_w}}{DIM}│{RESET}" for _, _, seg in visual],
+            f"{DIM}╰─ {stats}{' ' * bot_fill}╯{RESET}",
+        ]
+
+        redraw_rows = max(rendered_lines, len(lines))
+        out = "\r" + move_up(cursor_line)
+        for i in range(redraw_rows):
+            out += "\x1b[2K"
+            if i < len(lines):
+                out += lines[i]
+            if i != redraw_rows - 1:
+                out += "\n"
+        out += "\r" + move_up((redraw_rows - 1) - (cur_vrow + 1)) + move_right(cur_vcol + 1)
+        sys.stdout.write(out)
+        sys.stdout.flush()
+        rendered_lines = len(lines)
+        cursor_line = cur_vrow + 1
+
+    def finish():
+        sys.stdout.write("\r" + move_down((rendered_lines - 1) - cursor_line) + "\n")
+        sys.stdout.write("\x1b[?25h\x1b[?2004l")
+        sys.stdout.flush()
+
+    def insert_text(s):
+        nonlocal row, col
+        if not s:
+            return
+        parts = s.split("\n")
+        cur = buf[row]
+        tail = cur[col:]
+        if len(parts) == 1:
+            buf[row] = cur[:col] + parts[0] + tail
+            col += len(parts[0])
+            return
+        buf[row] = cur[:col] + parts[0]
+        new_lines = list(parts[1:-1]) + [parts[-1] + tail]
+        buf[row + 1:row + 1] = new_lines
+        row += len(new_lines)
+        col = len(parts[-1])
+
+    def backspace():
+        nonlocal row, col
+        if col > 0:
+            buf[row] = buf[row][:col - 1] + buf[row][col:]
+            col -= 1
+        elif row > 0:
+            prev = buf[row - 1]
+            col = len(prev)
+            buf[row - 1] = prev + buf[row]
+            del buf[row]
+            row -= 1
+
+    def delete_forward():
+        line = buf[row]
+        if col < len(line):
+            buf[row] = line[:col] + line[col + 1:]
+        elif row < len(buf) - 1:
+            buf[row] = line + buf[row + 1]
+            del buf[row + 1]
+
+    def load_from_history(hist_text):
+        nonlocal row, col
+        buf[:] = hist_text.split("\n") if hist_text else [""]
+        row = len(buf) - 1
+        col = len(buf[-1])
+
+    def handle_escape(seq):
+        nonlocal row, col, h_idx
+        if seq.startswith("[200~"):
+            paste = seq[5:]
+            while "\x1b[201~" not in paste:
+                paste += _raw_read_key(fd)
+            paste = paste.split("\x1b[201~", 1)[0]
+            if paste.endswith("\n") or paste.endswith("\r"):
+                paste = paste[:-1]
+            insert_text(paste)
+            return
+        if seq in ("[A", "OA"):
+            if history and h_idx > 0:
+                h_idx -= 1
+                load_from_history(history[h_idx])
+            return
+        if seq in ("[B", "OB"):
+            if history and h_idx < len(history):
+                h_idx += 1
+                load_from_history("" if h_idx == len(history) else history[h_idx])
+            return
+        if seq in ("[C", "OC"):
+            if col < len(buf[row]):
+                col += 1
+            elif row < len(buf) - 1:
+                row += 1
+                col = 0
+            return
+        if seq in ("[D", "OD"):
+            if col > 0:
+                col -= 1
+            elif row > 0:
+                row -= 1
+                col = len(buf[row])
+            return
+        if seq in ("[H", "OH"):
+            col = 0
+            return
+        if seq in ("[F", "OF"):
+            col = len(buf[row])
+            return
+        if seq == "[3~":
+            delete_forward()
+            return
+        if seq in ("\r", "\n"):
+            insert_text("\n")
+
+    termios.tcsetattr(fd, termios.TCSADRAIN, new)
+    sys.stdout.write("\x1b[?25h\x1b[?2004h\n")
+    sys.stdout.flush()
+    try:
+        render()
+        while True:
+            c = _raw_read_key(fd)
+            if c == "\x1b":
+                handle_escape(_raw_read_available(fd))
+            elif c == "\r":
+                finish()
+                return "\n".join(buf)
+            elif c == "\n":
+                insert_text("\n")
+            elif c == "\x03":
+                raise KeyboardInterrupt
+            elif c == "\x04":
+                if not any(buf):
+                    raise EOFError
+            elif c in ("\x7f", "\x08"):
+                backspace()
+            elif c == "\x15":
+                buf[row] = ""
+                col = 0
+            elif c >= " " or c == "\t":
+                insert_text(c)
+            render()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\x1b[?25h\x1b[?2004l")
+        sys.stdout.flush()
+
+
+def read_multiline(initial="", history=None):
+    """Public entry point. Returns the entered text, or '' on empty submit.
+    Raises EOFError / KeyboardInterrupt to match `input()`'s contract."""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        # Fallback path — single-line input. Same UX as before this feature.
+        return _chatbox_fallback(f"{CYAN}you ›{RESET} ")
+    try:
+        return _chatbox_raw(initial, history)
+    except (EOFError, KeyboardInterrupt):
+        raise
+    except (OSError, termios.error):
+        return _chatbox_fallback(f"{CYAN}you ›{RESET} ")
+
+
 # --- repl -------------------------------------------------------------------
 BANNER = f"""{BOLD}minion{RESET} {DIM}·{RESET} {CYAN}{MODEL}{RESET}
 {DIM}  {client.base_url}  ·  /yolo /compress /reset /quit  ·  log → llamacpp.log{RESET}"""
@@ -529,12 +801,14 @@ def main():
     print(BANNER)
     print()
     messages = [{"role": "system", "content": SYSTEM}]
+    history = []  # past user submissions, newest last; Up/Down navigates
     while True:
         try:
-            user = input(f"{CYAN}you ›{RESET} ").strip()
+            user = read_multiline(history=history)
         except (EOFError, KeyboardInterrupt):
             print()
             break
+        user = user.strip()
         if not user:
             continue
         if user == "/quit":
@@ -564,6 +838,10 @@ def main():
             print(f"{DIM}  └ compressed {summarized_n} turns → 1 summary "
                   f"({summary_chars} chars), kept last {kept_n} verbatim{RESET}")
             continue
+        # record for history (skip duplicates of the very last entry so
+        # Up doesn't immediately re-show what was just submitted)
+        if not history or history[-1] != user:
+            history.append(user)
         print()  # breathing room before the spinner/text starts
         messages.append({"role": "user", "content": user})
         steps = 0
