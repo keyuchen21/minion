@@ -7,7 +7,137 @@ All notable changes to `minion.py` from this point forward.
 > `MINION_*` for clarity. The old env vars are silently ignored — set the new
 > ones.
 
-## Unreleased
+### Added — pinned status bar (DECSTBM scroll region)
+A one-line status bar pinned at row 1 of the terminal (model name, source,
+approval mode, endpoint, command hints) using DECSTBM — the same scroll-region
+primitive tmux / vim / less use for their status lines. Chat output scrolls
+in the region below it (rows 2..bottom) without disturbing the bar.
+
+- New `_setup_status_bar()` — emits `\033[2;{rows}r` to set the scroll
+  region, paints row 1 with `_build_status_bar()`, erases stale content
+  below the bar (`\033[2;1H\033[J`), and parks the cursor at the bottom.
+  Sets `_STATUS_BAR_ACTIVE` so `_paint_status_bar` knows it can repaint.
+- New `_build_status_bar(cols)` — composes the status string left-to-right,
+  dropping less-important pieces (log path, URL, commands) when the terminal
+  is too narrow. Adds the source name in magenta when more than one source is
+  configured. Shows the approval mode color-coded (green for yolo/high,
+  yellow for medium, dim for low).
+- New `_paint_status_bar()` — repaints row 1 after a `/source` or `/yolo` /
+  `/approval` switch so the bar always reflects current state.
+- New `--no-scroll-bottom` flag to disable the whole feature (useful for
+  piped/redirected output or terminals that don't implement DECSTBM).
+- `_banner()` simplified to a one-line welcome (model name + source) since
+  the bar now carries the endpoint/commands. Rebuilt on each call so it
+  reflects the active source after a switch.
+- Stale terminal content (previous shell output, prior sessions) is now
+  cleared on startup so it doesn't linger below the bar.
+
+> **Known limitation:** the pinned bar relies on terminal scroll-region
+> support. Works in most terminals and under tmux, but some multiplexers
+> (notably Zellij) don't fully implement DECSTBM — in those the bar may
+> scroll away after enough output.
+
+### Added — multi-source system (`MINION_SOURCES`)
+Define multiple named endpoints and switch between them at runtime without
+restarting. Each "source" bundles a base URL, API key, and optional model
+name. Conversation context is preserved across switches (use `/reset` for a
+clean slate).
+
+- New `MINION_SOURCES=local,zai` env var (comma-separated source names;
+  the first is the default at startup).
+- Per-source config via `MINION_SOURCE_<NAME>_BASE_URL`,
+  `MINION_SOURCE_<NAME>_API_KEY`, `MINION_SOURCE_<NAME>_MODEL`.
+- **`$key` indirection** — `MINION_SOURCE_ZAI_API_KEY=$zai_test` looks up
+  the env var (or `~/.env` key) named `zai_test` rather than taking the
+  literal string. Avoids duplicating keys that already live somewhere.
+- **Auto-discovery** — if `MINION_SOURCES` is unset, minion scans for
+  `MINION_SOURCE_*_BASE_URL` vars and builds sources from those.
+- New `Source` class (`resolve_model()` queries `/v1/models` if no model is
+  set; `display_model()` shows `auto` when unset). Each source has its own
+  `OpenAI` client.
+- New `switch_source(name)` — reassigns the global `client` / `MODEL` /
+  `ACTIVE` so a mid-session swap is picked up instantly by every function
+  that reads them.
+- New `--source <name>` flag and `MINION_ACTIVE` env var to pick the
+  starting source.
+- New `/source` REPL command — bare lists all sources with model + URL;
+  `/source <name>` switches and repaints the status bar.
+- New `sources.example.env` with an annotated multi-source template.
+- Backward compatible: if no `MINION_SOURCE_*` vars are present, a single
+  `local` source is built from the legacy `MINION_BASE_URL` /
+  `MINION_API_KEY` / `MINION_MODEL` vars.
+
+### Added — `~/.env` auto-loading (`MINION_ENV_FILE`)
+minion now reads `~/.env` at startup (before source discovery) and populates
+`os.environ` from it, without clobbering vars already set in the shell.
+Sources, API keys, and other config can live in one place instead of being
+exported in every terminal.
+
+- New `_load_env_file()` — parses `KEY=VALUE` lines (handles `export`
+  prefix, quoted values, comments, blank lines). Points at
+  `MINION_ENV_FILE` if set, otherwise `~/.env`.
+- Existing `export`-based setups keep working unchanged.
+
+### Added — escalating reasoning-loop nudges + retry limit
+The reasoning-loop guard now escalates across multiple cuts instead of
+firing the same nudge repeatedly.
+
+- `REASONING_LOOP_NUDGES` — a tuple of 3 escalating nudges: first is a
+  gentle "stop planning, take action"; second is stricter ("exactly one
+  concrete action"); third is a hard stop ("emit only a tool call now").
+  The nudge index is clamped to `len(nudges) - 1`.
+- New `MINION_REASONING_LOOP_RETRIES` env var (default: number of nudges)
+  — after this many cuts, minion stops retrying, prints a "max retries hit"
+  message, and drops back to the prompt for user input.
+- New `TURN_LOOP_CUT` return status from `model_turn`; the REPL increments
+  `reasoning_loop_cuts` and retries with the next nudge (resets to 0 on a
+  successful tool turn).
+- New `_nudge_current_user_turn(messages, nudge)` — strips any prior
+  `[Runtime note: …]` from the latest user turn and appends the new nudge.
+- New `RUNTIME_NOTE_RE` to clean up stale runtime notes before re-nudging.
+
+### Added — reasoning-loop milestone warnings
+As "ready-to-act" signals accumulate during reasoning, minion now prints
+visible warnings at 25 / 50 / 75 / 100% of the cut threshold — so you can
+see the model spiraling before it gets cut, not just at the cut itself.
+
+- `_ReasoningLoopSignalCounter.feed()` returns the running hit count.
+- Milestones computed as clamped fractions of `REASONING_LOOP_SIGNAL_LIMIT`;
+  warnings are yellow (`⚠ REASONING LOOP WARNING — M/N signals (XX%)`),
+  the threshold-cross is red (`⚠ REASONING LOOP LIMIT HIT`).
+- Fires at most ~5 lines per turn (first hit + 4 milestones) to keep noise
+  down while remaining impossible to miss in the dim reasoning stream.
+
+### Added — streaming usage + TTFT in stats footer
+The stats footer at the end of each turn now works with servers that send
+the standard OpenAI `usage` object (not just llama.cpp's `timings`).
+
+- `stream_options={"include_usage": True}` sent on all streaming requests so
+  the final SSE chunk carries token counts (OpenAI, Z.ai, vLLM, etc.).
+- **TTFT** (time-to-first-token) measured client-side on the first chunk
+  carrying real output; shown when available (`Tms ttft`).
+- Footer now shows cached-token counts when the server reports them
+  (`ctx P+C cached`).
+- Three-tier fallback: llama.cpp `timings` → standard `usage` object →
+  wall-clock only.
+
+### Added — `pip install` support
+- New `setup.py` / `pyproject.toml` — registers a `minion` console script
+  pointing at `minion:main()`. `pip install -e .` for editable (picks up
+  edits immediately), `pip install .` for non-editable.
+- New `requirements.txt` (`openai>=1.0`).
+
+### Changed — `model_turn` takes `reasoning_loop_cut_count`
+Now accepts a second parameter so the REPL can track how many times the
+reasoning loop has been cut in the current user turn and escalate nudges
+accordingly. The stub signature change is what broke the old compact-alias
+test.
+
+### Changed — open_stream sends `stream_options`
+Both the tools-enabled and fallback (no-tools) streaming requests now send
+`stream_options={"include_usage": True}`.
+
+---
 
 ### Added — Esc-to-interrupt during model generation
 Press **Esc** while the model is streaming (or during the spinner wait
@@ -27,8 +157,8 @@ to context so the model knows what happened on its next turn.
   the stream, prints `↳ interrupted by user (Esc) after N.Ns, N chars
   streamed`, appends a `[User interrupted your previous response with
   Esc. Acknowledge briefly and wait for their next message.]` user turn,
-  and returns `False` so the REPL drops to the prompt instead of looping
-  into another turn.
+  and returns `TURN_DONE` so the REPL drops to the prompt instead of
+  looping into another turn.
 - Spinner label changed to `"thinking · esc to interrupt"` so the
   affordance is visible at the wait-for-first-token moment.
 - In-flight tool calls (`run_bash`, `write_file`, etc.) are **not**
@@ -164,8 +294,8 @@ sequence (e.g. the assistant called a tool but the result was the last turn,
 or — more commonly — the assistant tool-call turn landed in `head` and only
 its `tool` result made it into `tail`), llama.cpp's chat template would raise
 `Message has tool role, but there was no previous assistant message with a
-tool call!` on the very next request. `compress()` now walks the front of the
-tail and drops any leading `tool` or unmatched `assistant(tool_calls)` turn
+tool call!` on the very next request. `compress()` now walks the front of
+the tail and drops any leading `tool` or unmatched `assistant(tool_calls)` turn
 before splicing the summary in. The `summarized_n` count is bumped by the
 number of extra turns absorbed so the user-visible footer stays honest.
 

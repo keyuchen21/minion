@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""minion — a deliberately tiny coding agent for self-hosted models.
+"""minion — a deliberately tiny coding agent for self-hosted or remote models.
 
 One file, one dep (`openai`), no TUI framework. Points at any OpenAI-compatible
-endpoint (vLLM / llama.cpp / SGLang). Survives models whose native tool-calling
-isn't wired up yet by falling back to parsing <tool_call>...</tool_call> tags
-out of the text — the convention most open models (Hermes/Qwen/Nemotron) emit.
+endpoint (vLLM / llama.cpp / SGLang / Z.ai / OpenAI itself). Survives models
+whose native tool-calling isn't wired up yet by falling back to parsing
+<tool_call>...</tool_call> tags out of the text — the convention most open
+models (Hermes/Qwen/Nemotron) emit.
 
   pip install openai
   export MINION_BASE_URL=http://localhost:8000/v1   # your served endpoint
@@ -12,8 +13,18 @@ out of the text — the convention most open models (Hermes/Qwen/Nemotron) emit.
   export MINION_API_KEY=sk-noop                    # any string; local servers ignore it
   python minion.py
 
-Toggles in-session: /yolo (skip confirms)  /approval [level]  /compress  /compact  /reset  /quit
-Flags: --yolo (never prompt)  --approval <low|medium|high>  (sets starting approval level)
+Multiple sources — define named endpoints and switch between them at runtime:
+
+  MINION_SOURCES=local,zai
+  MINION_SOURCE_LOCAL_BASE_URL=http://localhost:8080/v1
+  MINION_SOURCE_ZAI_BASE_URL=https://api.z.ai/api/paas/v4
+  MINION_SOURCE_ZAI_API_KEY=***                   # $name = key from env / ~/.env
+  MINION_SOURCE_ZAI_MODEL=glm-x-preview
+
+  python minion.py --source zai                     # start on Z.ai
+
+Toggles in-session: /source [name]  /yolo  /approval [level]  /compress  /compact  /reset  /quit
+Flags: --yolo  --approval <low|medium|high>  --source <name>  --no-scroll-bottom
 """
 import json
 import os
@@ -29,42 +40,192 @@ import time
 
 from openai import OpenAI, APIConnectionError
 
-# --- config -----------------------------------------------------------------
-client = OpenAI(
-    base_url=os.environ.get("MINION_BASE_URL", "http://localhost:8080/v1"),
-    api_key=os.environ.get("MINION_API_KEY", "sk-noop"),
-)
+# --- env file ---------------------------------------------------------------
+# Load ~/.env (or MINION_ENV_FILE) into os.environ without clobbering vars
+# already set in the shell. Lets source config / API keys live in one place
+# instead of being exported in every terminal.
+_ENV_FILE = os.path.expanduser(os.environ.get("MINION_ENV_FILE", "~/.env"))
 
-# Approval gating. Three risk levels (low < medium < high) plus an implicit
-# "yolo" mode that never prompts. APPROVE_LEVEL is the minimum level that
-# requires approval: default "low" prompts at everything (today's behavior);
-# "medium" auto-approves low; "high" auto-approves low+medium. YOLO=True
-# short-circuits the risk call entirely — no point asking if we won't act on it.
+
+def _load_env_file():
+    try:
+        with open(_ENV_FILE, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                if k.startswith("export "):
+                    k = k[len("export "):].strip()
+                if not k or k in os.environ:
+                    continue
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                os.environ[k] = v
+    except (OSError, IOError):
+        pass
+
+
+_load_env_file()
+
+
+# --- model sources ----------------------------------------------------------
+# minion talks to any OpenAI-compatible endpoint. A "source" bundles a
+# base_url, api_key, and model name. Define sources with env vars:
+#
+#   MINION_SOURCES=local,zai
+#   MINION_SOURCE_LOCAL_BASE_URL=http://localhost:8080/v1
+#   MINION_SOURCE_ZAI_BASE_URL=https://api.z.ai/api/paas/v4
+#   MINION_SOURCE_ZAI_API_KEY=$zai_test        ← $name = look up env/file key
+#   MINION_SOURCE_ZAI_MODEL=glm-x-preview
+#
+# If no MINION_SOURCE_* vars are present, a single "local" source is built
+# from the legacy MINION_BASE_URL / MINION_API_KEY / MINION_MODEL vars
+# (same defaults as before, so existing setups keep working).
+# Switch at runtime with /source.
+
+class Source:
+    def __init__(self, name, base_url, api_key, model=None):
+        self.name = name
+        self.base_url = base_url
+        self.api_key = api_key or "sk-noop"
+        self.model = model or None  # None → ask the server at resolve time
+        self.client = OpenAI(base_url=base_url, api_key=self.api_key)
+
+    def resolve_model(self):
+        if self.model:
+            return self.model
+        try:
+            return self.client.models.list(timeout=10).data[0].id
+        except Exception:
+            return "local-model"
+
+    def display_model(self):
+        return self.model or "auto"
+
+
+def _resolve_api_key(val):
+    """$name → look up env var (populated from ~/.env if present); else literal."""
+    if val and val.startswith("$"):
+        return os.environ.get(val[1:], "")
+    return val
+
+
+def _discover_sources():
+    """Build SOURCES + SOURCE_ORDER from MINION_SOURCE_* env vars, falling
+    back to a single 'local' source from the legacy MINION_* vars."""
+    names = []
+    raw = os.environ.get("MINION_SOURCES", "")
+    if raw:
+        names = [n.strip() for n in raw.split(",") if n.strip()]
+    # auto-discover from MINION_SOURCE_<NAME>_BASE_URL if MINION_SOURCES absent
+    if not names:
+        prefix = "MINION_SOURCE_"
+        found = []
+        for k in os.environ:
+            if k.startswith(prefix) and k.endswith("_BASE_URL"):
+                found.append(k[len(prefix):-len("_BASE_URL")].lower())
+        names = sorted(found)
+    for name in names:
+        p = f"MINION_SOURCE_{name.upper()}_"
+        base_url = os.environ.get(p + "BASE_URL")
+        if not base_url:
+            continue
+        api_key = _resolve_api_key(os.environ.get(p + "API_KEY"))
+        model = os.environ.get(p + "MODEL")
+        src = Source(name, base_url, api_key, model)
+        SOURCES[name] = src
+        SOURCE_ORDER.append(name)
+    if not SOURCES:
+        # legacy fallback: one source from MINION_BASE_URL etc.
+        src = Source(
+            "local",
+            os.environ.get("MINION_BASE_URL", "http://localhost:8080/v1"),
+            os.environ.get("MINION_API_KEY", "sk-noop"),
+            os.environ.get("MINION_MODEL"),
+        )
+        SOURCES["local"] = src
+        SOURCE_ORDER.append("local")
+
+
+SOURCES = {}        # name → Source
+SOURCE_ORDER = []   # preserve definition order for /source listing
+ACTIVE = None       # current Source
+
+# `client` and `MODEL` are bare globals read throughout the file. They always
+# mirror the active source; switch_source() reassigns both. Every function that
+# needs them (open_stream, _assess_risk, compress, …) does a call-time global
+# lookup, so a mid-session swap is picked up instantly — same pattern /yolo
+# already uses for its own globals.
+client = None
+MODEL = None
+
+
+def switch_source(name):
+    """Swap the active source. Reassigns client + MODEL globals. Returns True
+    on success, False (with a message) if the name is unknown."""
+    global ACTIVE, client, MODEL
+    src = SOURCES.get(name)
+    if not src:
+        print(f"{RED}  ✗ unknown source {name!r}{RESET}")
+        return False
+    ACTIVE = src
+    client = src.client
+    MODEL = src.resolve_model()
+    return True
+
+
+_discover_sources()
+
+# Pick the starting source: --source flag, then MINION_ACTIVE env, then first.
+_start = None
+for _i, _arg in enumerate(sys.argv):
+    if _arg == "--source" and _i + 1 < len(sys.argv):
+        _start = sys.argv[_i + 1]
+        break
+_start = _start or os.environ.get("MINION_ACTIVE") or (SOURCE_ORDER[0] if SOURCE_ORDER else None)
+if not _start or _start not in SOURCES:
+    _start = SOURCE_ORDER[0] if SOURCE_ORDER else None
+if _start:
+    switch_source(_start)
+
+
+# --- approval gating --------------------------------------------------------
+# Three risk levels (low < medium < high) plus an implicit "yolo" mode that
+# never prompts. APPROVE_LEVEL is the maximum risk level to AUTO-APPROVE:
+# actions classified at ≤ APPROVE_LEVEL run without prompting; anything
+# strictly above prompts.
+#   "low"    → auto-approve low (reads, grep, wc); prompt medium + high
+#   "medium" → auto-approve low + medium (edits, cp, mv, tests); prompt high
+#   "high"   → auto-approve everything (never prompts)
+# YOLO=True short-circuits entirely (skips even the risk-classifier call).
 LEVEL_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+# Accept full words and common abbreviations (med, hi, lo, m, h, l …).
+_LEVEL_ALIASES = {
+    "l": "low", "lo": "low", "low": "low",
+    "m": "medium", "med": "medium", "mid": "medium", "medium": "medium",
+    "h": "high", "hi": "high", "high": "high",
+}
+
+
+def _normalize_level(arg):
+    """Resolve 'med' → 'medium', 'hi' → 'high', etc. Returns the canonical
+    level name or None if the input isn't recognised."""
+    return _LEVEL_ALIASES.get(arg.lower().strip())
 YOLO = "--yolo" in sys.argv
-APPROVE_LEVEL = "low"  # overridden by --approval <level> below
+APPROVE_LEVEL = "low"
 for _i, _arg in enumerate(sys.argv):
     if _arg == "--approval" and _i + 1 < len(sys.argv):
-        _lvl = sys.argv[_i + 1].lower()
-        if _lvl in LEVEL_ORDER:
+        _lvl = _normalize_level(sys.argv[_i + 1])
+        if _lvl:
             APPROVE_LEVEL = _lvl
         else:
-            print(f"{RED}  ✗ unknown --approval level {_arg!r} (want low|medium|high); using default 'low'{RESET}")
+            print(f"  ✗ unknown --approval level {sys.argv[_i + 1]!r} (want low|medium|high); using default 'low'")
 if YOLO:
     APPROVE_LEVEL = None  # yolo overrides --approval; never prompt
-
-
-def resolve_model():
-    """MINION_MODEL if set, else ask the server what it's actually serving."""
-    if os.environ.get("MINION_MODEL"):
-        return os.environ["MINION_MODEL"]
-    try:
-        return client.models.list().data[0].id
-    except Exception:
-        return "local-model"  # server down — main() will report it cleanly
-
-
-MODEL = resolve_model()
 
 # --- base-level traffic log -------------------------------------------------
 # Append-only JSONL record of every byte we ship to / receive from the server.
@@ -324,21 +485,33 @@ REASONING_LOOP_SIGNALS = (
     "start with the code",
 )
 REASONING_LOOP_SIGNAL_LIMIT = _env_int("MINION_REASONING_LOOP_SIGNALS", 10)
-REASONING_LOOP_NUDGE = (
+REASONING_LOOP_NUDGES = (
     "You are looping in reasoning after repeatedly deciding to start implementation. "
     "Stop planning now. Take the next concrete action: either call the appropriate tool "
-    "or give the final answer. Do not continue private reasoning."
+    "or give the final answer. Do not continue private reasoning.",
+    "The previous runtime nudge did not work. Your next assistant turn must contain "
+    "exactly one concrete action: either a tool call or the final answer. Do not "
+    "explain, plan, or continue reasoning. If you need file context, call read_file "
+    "or list_dir now.",
+    "Hard stop. Emit only a tool call now. If native tool calls are unavailable, "
+    "emit exactly one <tool_call>{...}</tool_call> block and nothing else. For code "
+    "edits, read the target file first unless you already know the exact replacement.",
 )
+REASONING_LOOP_NUDGE = REASONING_LOOP_NUDGES[0]
+REASONING_LOOP_RETRY_LIMIT = _env_int(
+    "MINION_REASONING_LOOP_RETRIES", len(REASONING_LOOP_NUDGES))
+RUNTIME_NOTE_RE = re.compile(r"\n\n\[Runtime note: .*?\]\s*$", re.DOTALL)
 
 
 def _nudge_current_user_turn(messages, nudge):
+    note = f"[Runtime note: {nudge}]"
     for msg in reversed(messages):
         if msg.get("role") != "user" or not isinstance(msg.get("content"), str):
             continue
-        if nudge not in msg["content"]:
-            msg["content"] += f"\n\n[Runtime note: {nudge}]"
+        content = RUNTIME_NOTE_RE.sub("", msg["content"]).rstrip()
+        msg["content"] = f"{content}\n\n{note}" if content else note
         return
-    messages.append({"role": "user", "content": nudge})
+    messages.append({"role": "user", "content": note})
 
 
 # --- risk classifier --------------------------------------------------------
@@ -409,8 +582,12 @@ def _confirm(action):
     Flow:
       1. YOLO → True (no call, no prompt).
       2. Ask the model for a risk level (skipped in step 1).
-      3. If level < APPROVE_LEVEL → auto-allow (printed as a one-liner).
+      3. If level ≤ APPROVE_LEVEL → auto-allow (printed as a one-liner).
       4. Otherwise prompt, showing the level + reason so the user has context.
+
+    Reads module globals YOLO and APPROVE_LEVEL at call time — /yolo and
+    /approval reassign them mid-session, and we must always see the latest
+    value, not a snapshot from when the tool function was defined.
     """
     if YOLO:
         return True
@@ -423,7 +600,8 @@ def _confirm(action):
         sp.stop()
     try:
         level, reason = _assess_risk(action)
-        if APPROVE_LEVEL is not None and LEVEL_ORDER[level] < LEVEL_ORDER[APPROVE_LEVEL]:
+        # APPROVE_LEVEL is the max level to AUTO-APPROVE. level ≤ threshold → run.
+        if APPROVE_LEVEL is not None and LEVEL_ORDER[level] <= LEVEL_ORDER[APPROVE_LEVEL]:
             # Auto-allow. Show the assessment so the user has a paper trail.
             short = reason if len(reason) <= 80 else reason[:77] + "..."
             print(f"{DIM}  ↳ auto-allow [{level}] {action}  ({short}){RESET}")
@@ -497,13 +675,15 @@ def open_stream(messages):
         try:
             _log_event("req", {"model": MODEL, "messages": messages, "tools": TOOLS, "stream": True})
             stream = client.chat.completions.create(
-                model=MODEL, messages=messages, tools=TOOLS, stream=True)
+                model=MODEL, messages=messages, tools=TOOLS, stream=True,
+                stream_options={"include_usage": True})
         except APIConnectionError:
             raise  # server unreachable — don't bother retrying without tools
         except Exception:  # reachable but rejected tools= → text-protocol fallback
             _log_event("req", {"model": MODEL, "messages": messages, "stream": True, "_fallback": "no-tools"})
             stream = client.chat.completions.create(
-                model=MODEL, messages=messages, stream=True)
+                model=MODEL, messages=messages, stream=True,
+                stream_options={"include_usage": True})
         # Wrap the stream so every chunk is captured to the log on its way out.
         return _LoggingStream(stream, _llog)
     except APIConnectionError:
@@ -683,11 +863,33 @@ class _ReasoningLoopSignalCounter:
         return self.hits
 
 
-# --- one model turn (streamed), returns True if it called tools -------------
-def model_turn(messages):
-    stream = open_stream(messages)
+TURN_DONE = "done"
+TURN_TOOL = "tool"
+TURN_LOOP_CUT = "loop_cut"
+
+
+# --- one model turn (streamed), returns TURN_* status -----------------------
+def model_turn(messages, reasoning_loop_cut_count=0):
+    # Start the spinner BEFORE open_stream() so the HTTP-handshake + interrupt-
+    # watcher-setup window (which can be tens of ms on a warm local server but
+    # seconds on a cold/wake-from-sleep one) isn't a frozen green-text gap.
+    # The spinner is still killed by the first SSE chunk in the loop below.
+    # t0 must be set BEFORE open_stream() — the HTTP request is sent inside
+    # open_stream() (TCP/TLS handshake, request bytes, etc.), and all of that
+    # latency is part of TTFT. If we set t0 after, the server has already been
+    # processing and the first token may be sitting in the buffer by the time
+    # we start the clock, making TTFT look implausibly tiny.
+    t0 = time.time()
+    spinner = LifeSpinner(label="thinking · esc to interrupt")
+    spinner.start()
+    try:
+        stream = open_stream(messages)
+    except Exception:
+        spinner.stop()
+        raise
     if stream is None:
-        return False  # error already reported; REPL continues
+        spinner.stop()
+        return TURN_DONE  # error already reported; REPL continues
 
     # Interrupt watcher: a daemon thread watches stdin for bare Esc. On hit,
     # it sets _USER_INTERRUPTED and closes the stream; the main loop breaks
@@ -698,12 +900,10 @@ def model_turn(messages):
     _USER_INTERRUPTED.clear()
     watcher = threading.Thread(target=_interrupt_watcher, daemon=True)
     watcher.start()
-
-    spinner = LifeSpinner(label="thinking · esc to interrupt")
-    spinner.start()
-    t0 = time.time()
     content, tcs, mode = [], {}, None
     timings = None
+    usage = None
+    t_first = None   # time of first output token (for TTFT)
     loop_signals = _ReasoningLoopSignalCounter(REASONING_LOOP_SIGNALS)
     loop_cut = False
     interrupted = False
@@ -723,7 +923,24 @@ def model_turn(messages):
             # first byte in: kill the spinner, let the real output take this line
             if spinner._t is not None:
                 spinner.stop()
+            # Capture streaming usage (OpenAI/Z.ai send a final chunk with
+            # usage populated when stream_options.include_usage is True).
+            # This chunk has an empty choices array, so check before the
+            # choices guard below.
+            if chunk.usage:
+                usage = chunk.usage
+            # The final usage-only chunk has an empty choices array — nothing
+            # else to do with it.
+            if not chunk.choices:
+                continue
             d = chunk.choices[0].delta
+            # Capture TTFT on the first chunk carrying real output (reasoning,
+            # content, or tool calls).
+            if t_first is None:
+                rc_peek = getattr(d, "reasoning_content", None) or \
+                          (getattr(d, "model_extra", None) or {}).get("reasoning_content")
+                if d.content or d.tool_calls or rc_peek:
+                    t_first = time.time() - t0
             # llama.cpp attaches a `timings` object to the final chunk — grab it
             # for the stats footer. It's the only place we get real tok/s numbers
             # (streaming `usage` is always null on llama.cpp).
@@ -742,7 +959,38 @@ def model_turn(messages):
                     mode = "think"
                 print(f"{DIM}{rc}{RESET}", end="", flush=True)
                 if REASONING_LOOP_SIGNAL_LIMIT > 0 and not content and not tcs:
+                    prev_hits = loop_signals.hits
                     hits = loop_signals.feed(rc)
+                    # Print a loud, obvious counter on threshold crossings so the
+                    # user can see the model spiraling before it gets cut. We
+                    # fire at the first hit, then at 25/50/75/100% of the limit
+                    # (clamped so milestones never exceed the limit). Keeps the
+                    # noise down to ≤5 lines per turn while still being impossible
+                    # to miss in the dim reasoning stream.
+                    _limit = REASONING_LOOP_SIGNAL_LIMIT
+                    _milestones = sorted(set(min(_limit, v) for v in (
+                        1,                                       # first hit
+                        (_limit + 3) // 4,                       # 25%
+                        (_limit + 1) // 2,                       # 50%
+                        (3 * _limit + 3) // 4,                   # 75%
+                        _limit,                                  # 100% — the cut itself
+                    ) if 0 < v <= _limit))
+                    crossed_milestones = [m for m in _milestones if prev_hits < m <= hits]
+                    for milestone in crossed_milestones:
+                        # Break out of the dim inline stream so the warning
+                        # lands on its own line, then reopen reasoning mode
+                        # below so subsequent chunks (if any) keep streaming
+                        # cleanly. The end-of-loop divider in the finally-ish
+                        # block below will close it out properly when we break.
+                        print()
+                        if milestone >= _limit:
+                            print(f"{RED}  ⚠ REASONING LOOP LIMIT HIT — {hits}/{_limit} ready-to-act signals "
+                                  f"(“{loop_signals.phrases[0]}”, etc.) — cutting stream now{RESET}")
+                        else:
+                            pct = (milestone * 100) // _limit if _limit else 0
+                            print(f"{YELLOW}  ⚠ REASONING LOOP WARNING — {milestone}/{_limit} ready-to-act signals "
+                                  f"({pct}% of cut threshold); model keeps re-deciding to start coding{RESET}")
+                        print(f"{DIM}  ── reasoning ──{RESET}")
                     if hits >= REASONING_LOOP_SIGNAL_LIMIT:
                         loop_cut = True
                         close = getattr(stream, "close", None)
@@ -798,21 +1046,59 @@ def model_turn(messages):
         messages.append({"role": "user", "content":
             "[User interrupted your previous response with Esc. "
             "Acknowledge briefly and wait for their next message.]"})
-        return False
+        return TURN_DONE
 
     if loop_cut:
-        print(f"{YELLOW}  ↳ cut reasoning loop after {loop_signals.hits} ready-to-act signals; nudging implementation{RESET}")
-        _nudge_current_user_turn(messages, REASONING_LOOP_NUDGE)
-        return True
+        retry_limit = max(0, REASONING_LOOP_RETRY_LIMIT)
+        if reasoning_loop_cut_count >= retry_limit:
+            print(f"{RED}  ✂ REASONING LOOP MAX RETRIES HIT — gave up after "
+                  f"{reasoning_loop_cut_count} cut{'s' if reasoning_loop_cut_count != 1 else ''} "
+                  f"× {loop_signals.hits} ready-to-act signals each; "
+                  f"waiting for user input{RESET}")
+            return TURN_DONE
+        nudge = REASONING_LOOP_NUDGES[
+            min(reasoning_loop_cut_count, len(REASONING_LOOP_NUDGES) - 1)]
+        print(f"{YELLOW}  ✂ REASONING LOOP CUT — {loop_signals.hits} ready-to-act signals "
+              f"(limit {REASONING_LOOP_SIGNAL_LIMIT}); nudging implementation "
+              f"(retry {reasoning_loop_cut_count + 1}/{retry_limit}){RESET}")
+        _nudge_current_user_turn(messages, nudge)
+        return TURN_LOOP_CUT
 
-    # stats footer — only if llama.cpp gave us timings; otherwise fall back to wall-clock
+    # stats footer — prefer llama.cpp timings if present; otherwise fall back
+    # to the standard streaming `usage` object (OpenAI, Z.ai, etc.); otherwise
+    # fall back to wall-clock only. TTFT (time to first token) is shown when
+    # available — for local it comes from llama.cpp timings, for remote we
+    # measure it client-side.
     if timings and timings.get("predicted_n"):
         prompt_n = timings.get("prompt_n", 0)
         cache_n = timings.get("cache_n", 0)
         gen_n = timings["predicted_n"]
         tps = timings.get("predicted_per_second", 0)
         ctx = f"ctx {prompt_n}+{cache_n} cached" if cache_n else f"ctx {prompt_n}"
-        print(f"{DIM}  └ {gen_n} tok · {tps:5.1f} tok/s · {ctx} · {elapsed:4.1f}s wall{RESET}")
+        prompt_ms = timings.get("prompt_ms", 0)
+        ttft = (prompt_ms / 1000.0) if prompt_ms else t_first
+        parts = [f"{gen_n} tok", f"{tps:5.1f} tok/s", ctx]
+        if ttft:
+            parts.append(f"{ttft*1000:4.0f}ms ttft")
+        parts.append(f"{elapsed:4.1f}s wall")
+        print(f"{DIM}  └ {' · '.join(parts)}{RESET}")
+    elif usage and (usage.completion_tokens or 0):
+        gen_n = usage.completion_tokens or 0
+        prompt_n = usage.prompt_tokens or 0
+        cache_n = getattr(usage, "prompt_tokens_details", None)
+        cached = None
+        if cache_n is not None:
+            cached = getattr(cache_n, "cached_tokens", None)
+        tps = gen_n / elapsed if elapsed > 0 else 0
+        if cached:
+            ctx = f"ctx {prompt_n}+{cached} cached"
+        else:
+            ctx = f"ctx {prompt_n}"
+        parts = [f"{gen_n} tok", f"{tps:5.1f} tok/s", ctx]
+        if t_first:
+            parts.append(f"{t_first*1000:4.0f}ms ttft")
+        parts.append(f"{elapsed:4.1f}s wall")
+        print(f"{DIM}  └ {' · '.join(parts)}{RESET}")
     elif text or tcs:
         print(f"{DIM}  └ {elapsed:4.1f}s wall{RESET}")
 
@@ -828,17 +1114,17 @@ def model_turn(messages):
                 args = {}
             messages.append({"role": "tool", "tool_call_id": c["id"],
                              "content": run_tool(c["name"], args)})
-        return True
+        return TURN_TOOL
 
     calls = parse_text_calls(text)  # text-fallback path
     if calls:
         messages.append({"role": "assistant", "content": text})
         obs = [f"Observation ({n}): {run_tool(n, a)}" for n, a in calls]
         messages.append({"role": "user", "content": "\n".join(obs)})
-        return True
+        return TURN_TOOL
 
     messages.append({"role": "assistant", "content": text})
-    return False
+    return TURN_DONE
 
 
 # --- multi-line chatbox input ---------------------------------------------
@@ -1111,12 +1397,110 @@ def read_multiline(initial="", history=None):
 
 
 # --- repl -------------------------------------------------------------------
-BANNER = f"""{BOLD}minion{RESET} {DIM}·{RESET} {CYAN}{MODEL}{RESET}
-{DIM}  {client.base_url}  ·  /yolo /approval /compress /compact /reset /quit  ·  log → llamacpp.log{RESET}"""
+# The descriptor (URL, commands, log path) used to live here in the banner.
+# Now that the status bar at row 1 carries it permanently, the banner is
+# just a one-line welcome at the bottom of the scroll region — model name
+# only, since everything else is already pinned at the top.
+def _banner():
+    """One-line welcome shown after the status bar is set up. Rebuilt on
+    each call so it reflects the current source after a /source switch."""
+    src_tag = f" {DIM}·{RESET} {MAGENTA}{ACTIVE.name}{RESET}" if len(SOURCES) > 1 else ""
+    return f"{BOLD}minion{RESET} {DIM}·{RESET} {CYAN}{MODEL}{RESET}{src_tag}"
+
+
+_STATUS_BAR_ACTIVE = False
+
+
+def _build_status_bar(cols):
+    """Compose the status-bar string for the given terminal width. Builds
+    left-to-right, dropping less-important pieces (log path, URL, commands)
+    when the terminal is too narrow. Adds the source name in magenta when
+    more than one source is configured."""
+    sep = f" {DIM}·{RESET} "
+    def _vis(s):
+        return len(re.sub(r'\033\[[0-9;]*m', '', s))
+
+    parts = [f"{BOLD}minion{RESET}", f"{CYAN}{MODEL}{RESET}"]
+    if len(SOURCES) > 1:
+        parts.append(f"{MAGENTA}{ACTIVE.name}{RESET}")
+    # Show the approval mode so it's always visible at a glance. Green when
+    # nothing will prompt (high / yolo), yellow when medium, dim for the
+    # default low.
+    if YOLO or APPROVE_LEVEL is None:
+        parts.append(f"{GREEN}yolo{RESET}")
+    elif APPROVE_LEVEL == "high":
+        parts.append(f"{GREEN}auto:high{RESET}")
+    elif APPROVE_LEVEL == "medium":
+        parts.append(f"{YELLOW}auto:medium{RESET}")
+    else:
+        parts.append(f"{DIM}auto:low{RESET}")
+    used = sum(_vis(p) for p in parts) + _vis(sep) * (len(parts) - 1)
+    for piece in (str(client.base_url),
+                  "/source /yolo /approval /compress /compact /reset /quit",
+                  "log → llamacpp.log"):
+        extra = _vis(sep) + _vis(piece)
+        if used + extra <= cols - 2:
+            parts.append(piece)
+            used += extra
+        else:
+            break
+    return sep.join(parts)
+
+
+def _setup_status_bar():
+    """Pin a one-line status bar at the top of the terminal and confine the
+    rest of the session to a scroll region below it (DECSTBM, same primitive
+    tmux / vim / less use for their status lines). Returns True if installed;
+    False if skipped (non-TTY, terminal too short, or --no-scroll-bottom).
+    Sets _STATUS_BAR_ACTIVE so _paint_status_bar knows it can repaint."""
+    global _STATUS_BAR_ACTIVE
+    if not sys.stdout.isatty() or "--no-scroll-bottom" in sys.argv:
+        return False
+    rows, cols = shutil.get_terminal_size((80, 24))
+    if rows < 5:
+        return False
+
+    status = _build_status_bar(cols)
+    sys.stdout.write(f"\033[2;{rows}r")
+    sys.stdout.write(f"\033[1;1H\033[2K{status}")
+    # Wipe the scroll region so stale terminal content (previous shell
+    # output, a prior minion session, etc.) doesn't linger below the bar.
+    # \033[J erases from the cursor (now at row 2) to the end of the display,
+    # which is exactly rows 2..rows — the scroll region we just set. Row 1
+    # (the freshly-painted status bar) is untouched since the cursor starts
+    # the erase at row 2.
+    sys.stdout.write(f"\033[2;1H\033[J")
+    sys.stdout.write(f"\033[{rows};1H")
+    sys.stdout.flush()
+    _STATUS_BAR_ACTIVE = True
+    return True
+
+
+def _paint_status_bar():
+    """Repaint row 1 after a /source switch. No-op if the bar was never
+    installed. Returns cursor to the bottom of the scroll region."""
+    if not _STATUS_BAR_ACTIVE:
+        return
+    sz = shutil.get_terminal_size((80, 24))
+    status = _build_status_bar(sz.columns)
+    sys.stdout.write(f"\033[1;1H\033[2K{status}")
+    sys.stdout.write(f"\033[{sz.lines};1H")
+    sys.stdout.flush()
 
 
 def main():
-    print(BANNER)
+    global YOLO, APPROVE_LEVEL
+    # Status bar at top + scroll region for the rest. The bar (model, URL,
+    # commands, log path) stays pinned at row 1 no matter how long the session
+    # runs; everything else — banner, chat, model output, tool boxes — lives
+    # in rows 2..rows and scrolls within that region. This replaces the old
+    # "print N blank lines to push the banner to the bottom" trick, which was
+    # both fragile (depends on banner height) and one-shot (the banner
+    # scrolled away the moment anything was printed). Skipped when stdout
+    # isn't a TTY (piped/redirected — would inject escape codes into a log
+    # file) or when the user passes --no-scroll-bottom.
+    _setup_status_bar()
+    print(_banner())
     print()
     messages = [{"role": "system", "content": SYSTEM}]
     history = []  # past user submissions, newest last; Up/Down navigates
@@ -1131,13 +1515,38 @@ def main():
             continue
         if user == "/quit":
             break
-        if user == "/yolo":
-            globals()["YOLO"] = not YOLO
-            if YOLO:
-                globals()["APPROVE_LEVEL"] = None  # never prompt
+        if user == "/source" or user.startswith("/source "):
+            sp = user.split()
+            if len(sp) == 1:
+                print(f"{DIM}  sources:{RESET}")
+                for sname in SOURCE_ORDER:
+                    src = SOURCES[sname]
+                    mark = f"{GREEN}★{RESET}" if sname == ACTIVE.name else f"{DIM} ·{RESET}"
+                    m = src.display_model()
+                    print(f"  {mark} {CYAN}{sname:<12}{RESET} {DIM}{m} @ {src.base_url}{RESET}")
+                print(f"{DIM}  /source <name> to switch · context preserved (use /reset to clear){RESET}")
             else:
-                globals()["APPROVE_LEVEL"] = "low"  # back to default
+                target = sp[1]
+                if target not in SOURCES:
+                    avail = ", ".join(SOURCE_ORDER)
+                    print(f"{RED}  ✗ unknown source {target!r} — available: {avail}{RESET}")
+                    continue
+                if target == ACTIVE.name:
+                    print(f"{DIM}  already on {target}{RESET}")
+                    continue
+                switch_source(target)
+                src = SOURCES[target]
+                print(f"{BOLD}{YELLOW}  → switched to {target}{RESET} {DIM}({MODEL} @ {src.base_url}){RESET}")
+                _paint_status_bar()
+            continue
+        if user == "/yolo":
+            YOLO = not YOLO
+            if YOLO:
+                APPROVE_LEVEL = None  # never prompt
+            else:
+                APPROVE_LEVEL = "low"  # back to default
             print(f"{DIM}  yolo={YOLO}  approval={('off' if YOLO else APPROVE_LEVEL)}{RESET}")
+            _paint_status_bar()
             continue
         if user.startswith("/approval"):
             parts = user.split()
@@ -1146,15 +1555,18 @@ def main():
                 cur = "off (yolo)" if YOLO else (APPROVE_LEVEL or "off")
                 print(f"{DIM}  approval={cur}  (low|medium|high|yolo){RESET}")
                 continue
-            arg = parts[1].lower()
-            if arg in LEVEL_ORDER:
-                globals()["YOLO"] = False
-                globals()["APPROVE_LEVEL"] = arg
-                print(f"{DIM}  approval={arg} (prompt at {arg} and above){RESET}")
-            elif arg == "yolo":
-                globals()["YOLO"] = True
-                globals()["APPROVE_LEVEL"] = None
+            arg = parts[1]
+            resolved = _normalize_level(arg)
+            if resolved:
+                YOLO = False
+                APPROVE_LEVEL = resolved
+                print(f"{DIM}  approval={resolved} (auto-allow ≤ {resolved}){RESET}")
+                _paint_status_bar()
+            elif arg.lower() == "yolo":
+                YOLO = True
+                APPROVE_LEVEL = None
                 print(f"{DIM}  approval=off (yolo — never prompt){RESET}")
+                _paint_status_bar()
             else:
                 print(f"{YELLOW}  unknown level {arg!r} — want low|medium|high|yolo{RESET}")
             continue
@@ -1186,8 +1598,18 @@ def main():
         print()  # breathing room before the spinner/text starts
         messages.append({"role": "user", "content": user})
         steps = 0
-        while model_turn(messages) and steps < 25:  # cap runaway tool loops
+        reasoning_loop_cuts = 0
+        while steps < 25:  # cap runaway tool/retry loops
+            status = model_turn(messages, reasoning_loop_cuts)
+            if status == TURN_DONE:
+                break
             steps += 1
+            if status == TURN_LOOP_CUT:
+                reasoning_loop_cuts += 1
+                continue
+            if status == TURN_TOOL:
+                reasoning_loop_cuts = 0
+                continue
 
 
 if __name__ == "__main__":
