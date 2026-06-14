@@ -197,3 +197,11 @@ lines. The chat output scrolls in the region below it. Pass
 
 Every request and streamed SSE chunk is appended to `llamacpp.log` next to the
 script (JSONL). Useful for debugging what the model actually saw and returned.
+
+## Built with
+
+minion was developed using the following models:
+
+- **minion** (eating its own dog food)
+- [**GLM 5.2**](https://z.ai) (Z.ai)
+- [**MiniMax-M3**](https://www.minimaxi.com) (MiniMax)
