@@ -44,7 +44,7 @@ Point it at any OpenAI-compatible endpoint — a local llama.cpp / vLLM / SGLang
 remote API like Z.ai or OpenAI itself — and start chatting with an agent that
 can read, write, edit, and run shell commands in your project.
 
-The whole thing is one file (`minion.py`, ~3200 lines). No TUI framework, no
+The whole thing is one file (`minion.py`, ~3400 lines). No TUI framework, no
 plugin system, no config file format. It reads from environment variables (and
 `~/.env`), talks directly to the OpenAI SDK, and uses raw terminal escapes for
 its interface. If you want to understand or modify how it works, you read one
@@ -52,10 +52,12 @@ file. That's the whole pitch.
 
 It's built to survive the rough edges of self-hosted and open models: if the
 server doesn't support native tool-calling, it falls back to parsing
-`<tool_call>…</tool_call>` tags out of the model's text. If the server streams a
-separate `reasoning_content` field (MiniMax-M3, DeepSeek-R1, etc.), it renders
-that as a dim "thinking" block above the answer. It degrades gracefully rather
-than demanding a perfect server.
+standalone `[minion_tool_call]...[/minion_tool_call]` messages from the model's
+text. Quoted examples or source code containing tool-call delimiters are treated
+as normal text, and tool results have those delimiters escaped before they enter
+the next model context. If the server streams a separate `reasoning_content`
+field (MiniMax-M3, DeepSeek-R1, etc.), it renders that as a dim "thinking" block
+above the answer. It degrades gracefully rather than demanding a perfect server.
 
 ## Quick start
 
@@ -114,6 +116,22 @@ See [`sources.example.env`](sources.example.env) for a full annotated example.
 Switch at runtime with `/source [name]`. The conversation context is preserved
 across switches (use `/reset` if you want a clean slate).
 
+#### Built-in `together` source
+
+If `TOGETHER_API_KEY` is set (in `~/.env` or your shell), minion auto-registers
+a `together` source pointing at `https://api.together.xyz/v1`, defaulting to
+the `zai-org/GLM-5.2` model. Together hosts many models, so you can override
+the model per switch without editing any config:
+
+```
+/source together                    # → GLM-5.2 (the default)
+/source together zai-org/GLM-4.6    # → any other Together model id
+```
+
+It's registered last, so it never displaces your default startup source — you
+opt in with `/source together` (or `--source together`). Defining your own
+`MINION_SOURCE_TOGETHER_*` vars overrides the built-in entirely.
+
 ### Flags
 
 | flag                          | what it does                                              |
@@ -134,6 +152,7 @@ so per-user settings live in one place instead of being exported every shell.
 | `MINION_APPROVAL` | persistent default approval mode: `all`/`low`/`medium`/`high`/`yolo` (see below). CLI flags `--approval` / `--yolo` override it for a single run. |
 | `MINION_BASE_URL` / `MINION_MODEL` / `MINION_API_KEY` | legacy single-source config (or the `local` fallback) |
 | `MINION_SOURCES` / `MINION_SOURCE_*` | named multi-source endpoints |
+| `TOGETHER_API_KEY` | auto-registers a built-in `together` source (Together AI, default model `zai-org/GLM-5.2`); override with `MINION_SOURCE_TOGETHER_*` |
 | `MINION_HOME` / `MINION_SESSIONS_DIR` | where session JSON files are stored |
 | `MINION_MALFORMED_STREAM_RETRIES` | max clean retries for malformed/truncated tool-call args or SSE streams before waiting for user input (default 2) |
 | `MINION_REASONING_ONLY_CHARS` | reasoning-only stall cutoff before forcing a visible answer (default 36000; `0` disables) |
@@ -162,7 +181,7 @@ so per-user settings live in one place instead of being exported every shell.
 
 | command             | what it does                                            |
 | ------------------- | ------------------------------------------------------ |
-| `/source [name]`    | list sources or switch to one (context preserved)       |
+| `/source [name] [model]` | list sources, switch to one, or override its model for that switch (context preserved) |
 | `/yolo`             | toggle auto-approve for writes and bash                 |
 | `/approval [level]` | show or set risk threshold (`all`/`low`/`medium`/`high`/`yolo`) |
 | `/sessions [n]`     | list recent sessions, or show one in full               |
@@ -220,6 +239,12 @@ context for the decision:
 ```
 allow rm -rf /tmp/foo? [risk: HIGH — recursive force delete in /tmp] [Y/n/esc]
 ```
+
+For path-based write/edit risk, Minion sends the classifier its current working
+directory, detected project root (git root when available, otherwise the launch
+directory), and whether the target path is inside that root. A project under
+`~/Downloads` is still treated as in-project; `~/Downloads` only raises concern
+when the target is outside the active project root.
 
 At the prompt, press:
 

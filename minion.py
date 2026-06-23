@@ -35,9 +35,10 @@ Sessions — every chat is auto-saved to ~/.minion/sessions/ and resumable:
   /resume <n|short-id|title>      # switch to another session mid-chat
   /save [title]                   # save the current session (title optional)
 
-Toggles in-session: /source [name]  /yolo  /approval [level]  /compress  /compact  /reset  /clear  /new  /recover  /sessions  /resume  /save  /delete  /quit
+Toggles in-session: /source [name] [model]  /yolo  /approval [level]  /compress  /compact  /reset  /clear  /new  /recover  /sessions  /resume  /save  /delete  /quit
 Flags: --yolo  --approval <all|low|medium|high|yolo>  --source <name>  --resume <target>  --session <id>
 Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval mode; ~/.env or shell)
+       TOGETHER_API_KEY  (auto-registers a built-in `together` source; default model zai-org/GLM-5.2)
 """
 import json
 import os
@@ -500,13 +501,46 @@ class Source:
         self.model = model or None  # None → ask the server at resolve time
         self.client = OpenAI(base_url=base_url, api_key=self.api_key)
 
+    # Server-advertised ids that carry no real identity — when /v1/models
+    # returns one of these (bare llama.cpp with no --alias, or a generic
+    # OpenAI-compat stub), fall through to a /props probe before giving up so
+    # saved sessions don't all collapse into a meaningless "local-model".
+    _GENERIC_MODEL_IDS = {"local-model", "model", "auto", "unknown", "gpt-3.5-turbo"}
+
     def resolve_model(self):
         if self.model:
             return self.model
+        advertised = None
         try:
-            return self.client.models.list(timeout=10).data[0].id
+            advertised = self.client.models.list(timeout=10).data[0].id
         except Exception:
-            return "local-model"
+            advertised = None
+        if advertised and advertised.strip().lower() not in self._GENERIC_MODEL_IDS:
+            return advertised
+        # The endpoint gave us nothing useful. Many local servers (llama.cpp's
+        # llama-server) expose the actually-loaded model file at /props even
+        # when /v1/models only advertises a generic id — recover the real name
+        # (incl. quant) from there. Best-effort; any failure keeps the old value.
+        probed = self._probe_loaded_model()
+        return probed or advertised or "local-model"
+
+    def _probe_loaded_model(self):
+        """Best-effort GET <server>/props for the loaded model path/alias.
+        llama.cpp serves /props at the root (not under /v1). Returns None on
+        any failure — never raises, never required, makes no assumption about
+        what (if anything) consumes minion's session metrics."""
+        try:
+            root = re.sub(r"/v\d+/?$", "", self.base_url.rstrip("/"))
+            with urllib.request.urlopen(root + "/props", timeout=5) as r:
+                props = json.loads(r.read().decode("utf-8"))
+        except Exception:
+            return None
+        for key in ("model_alias", "model_path", "model"):
+            val = props.get(key)
+            if isinstance(val, str) and val.strip() and \
+                    val.strip().lower() not in self._GENERIC_MODEL_IDS:
+                return val.strip()
+        return None
 
     def display_model(self):
         return self.model or "auto"
@@ -555,6 +589,24 @@ def _discover_sources():
         SOURCES["local"] = src
         SOURCE_ORDER.append("local")
 
+    # Built-in convenience source: Together AI. It's a multi-model host (you
+    # point it at any model by id), so unlike the local fallback it only
+    # appears when a key is actually available — and only when the user
+    # hasn't already defined a "together" source themselves (so an explicit
+    # MINION_SOURCE_TOGETHER_* config always wins). Registered last, so the
+    # user's first/source-listed source stays the default at startup and
+    # `/source together` (or `--source together`) is purely opt-in.
+    if "together" not in SOURCES:
+        together_key = _resolve_api_key(os.environ.get("TOGETHER_API_KEY", ""))
+        if together_key:
+            SOURCES["together"] = Source(
+                "together",
+                "https://api.together.xyz/v1",
+                together_key,
+                "zai-org/GLM-5.2",  # default model; override per-switch via /source together <model>
+            )
+            SOURCE_ORDER.append("together")
+
 
 SOURCES = {}        # name → Source
 SOURCE_ORDER = []   # preserve definition order for /source listing
@@ -569,9 +621,16 @@ client = None
 MODEL = None
 
 
-def switch_source(name):
+def switch_source(name, model_override=None):
     """Swap the active source. Reassigns client + MODEL globals. Returns True
-    on success, False (with a message) if the name is unknown."""
+    on success, False (with a message) if the name is unknown.
+
+    `model_override` (optional) pins MODEL to a specific model id for this
+    switch instead of resolving the source's default — used by
+    `/source <name> <model>` so a multi-model host (e.g. Together) can be
+    pointed at any of its models without a config edit. A bare switch (no
+    override) always falls back to the source's configured/default model,
+    so `/source together` returns to GLM-5.2 even after an override."""
     global ACTIVE, client, MODEL
     src = SOURCES.get(name)
     if not src:
@@ -579,7 +638,24 @@ def switch_source(name):
         return False
     ACTIVE = src
     client = src.client
-    MODEL = src.resolve_model()
+    MODEL = model_override if model_override else src.resolve_model()
+    return True
+
+
+def restore_source(source_name, model=None):
+    """Best-effort restore of the source (and optional model) a session was
+    started on, used when resuming. Switches source if it's configured and
+    differs from the active one; if `model` is set and not equal to the
+    source's configured default, pins MODEL to it so a `/source <name>
+    <model>` override survives a resume. Returns True if the source is now
+    the requested one."""
+    if not source_name or source_name not in SOURCES:
+        return False
+    src = SOURCES[source_name]
+    pin = model if model and model != src.model else None
+    if source_name == ACTIVE.name and MODEL == (pin or src.model):
+        return True
+    switch_source(source_name, model_override=pin)
     return True
 
 
@@ -1011,9 +1087,9 @@ FINAL_ANSWER_TOOL_CHOICE = {
 SYSTEM = """You are a terminal coding agent working in the user's current directory.
 Use the provided tools to inspect and modify code. Take one concrete step at a time.
 
-If your runtime does NOT support native tool calls, emit a call as text exactly like:
-<tool_call>{"name": "read_file", "arguments": {"path": "foo.py"}}</tool_call>
-Emit nothing after a tool call; wait for the Observation. When the task is done, reply in plain prose."""
+If your runtime does NOT support native tool calls, emit a standalone text-protocol call exactly like:
+[minion_tool_call]{"name": "read_file", "arguments": {"path": "foo.py"}}[/minion_tool_call]
+Emit nothing before or after a tool call; wait for the Observation. When showing a tool-call example, use prose or a code block so it is not a standalone tool call. When the task is done, reply in plain prose."""
 
 
 def _env_int(name, default):
@@ -1293,10 +1369,100 @@ def _nudge_current_user_turn(messages, nudge):
 # Minion normally talks to reliable or local endpoints. Skipped entirely in YOLO
 # mode (no point paying for a call we won't act on) and for read-only tools.
 
+def _detect_project_root(cwd=None):
+    """Return the git root for cwd when available, otherwise cwd itself."""
+    cwd = os.path.realpath(cwd or os.getcwd())
+    if shutil.which("git"):
+        try:
+            r = subprocess.run(
+                ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=2)
+            root = r.stdout.strip()
+            if r.returncode == 0 and root:
+                return os.path.realpath(root)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return cwd
+
+
+PROJECT_ROOT = _detect_project_root()
+
+
+def _is_under_path(path, root):
+    try:
+        return os.path.commonpath([path, root]) == root
+    except (OSError, ValueError):
+        return False
+
+
+def _extract_action_path(action):
+    """Pull the primary file path from Minion's short approval action string."""
+    if not isinstance(action, str):
+        return None
+    action = action.strip()
+    if action.startswith("edit "):
+        return action[len("edit "):].strip() or None
+    m = re.match(r"^write\s+(.+)\s+\(\d+\s+bytes\)$", action)
+    if m:
+        return m.group(1).strip() or None
+    return None
+
+
+def _classify_action_path(path, cwd=None, project_root=None):
+    cwd = os.path.realpath(cwd or os.getcwd())
+    project_root = os.path.realpath(project_root or PROJECT_ROOT)
+    expanded = os.path.expanduser(path)
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(cwd, expanded)
+    abs_path = os.path.realpath(expanded)
+    home = os.path.realpath(os.path.expanduser("~"))
+    downloads = os.path.join(home, "Downloads")
+    rel_home = None
+    if _is_under_path(abs_path, home):
+        try:
+            rel_home = os.path.relpath(abs_path, home)
+        except ValueError:
+            rel_home = None
+    home_parts = [] if rel_home in (None, ".") else rel_home.split(os.sep)
+    touches_home_dotdir = bool(home_parts and home_parts[0].startswith("."))
+    in_project = _is_under_path(abs_path, project_root)
+    return {
+        "primary_path": abs_path,
+        "path_scope": "in_project" if in_project else "outside_project",
+        "path_in_cwd": _is_under_path(abs_path, cwd),
+        "path_in_downloads": _is_under_path(abs_path, downloads),
+        "path_touches_home_dotdir": touches_home_dotdir,
+    }
+
+
+def _risk_user_message(action):
+    cwd = os.path.realpath(os.getcwd())
+    msg = {
+        "action": action,
+        "cwd": cwd,
+        "project_root": os.path.realpath(PROJECT_ROOT),
+        "primary_path": None,
+        "path_scope": "unknown",
+        "scope_guidance": (
+            "Use project_root/path_scope for outside-project decisions. "
+            "A file under project_root is in-project even when project_root "
+            "is inside ~/Downloads."
+        ),
+    }
+    path = _extract_action_path(action)
+    if path:
+        msg.update(_classify_action_path(path, cwd=cwd))
+    return json.dumps(msg, sort_keys=True)
+
+
 RISK_SYSTEM = (
     "You are a risk classifier for a coding agent's tool calls. "
-    "Given one tool action, respond with ONLY a JSON object of the form "
+    "Given one tool action as JSON, respond with ONLY a JSON object of the form "
     '{"level": "low"|"medium"|"high", "reason": "<one short sentence>"}.\n'
+    "The user JSON includes cwd, project_root, and when possible path_scope. "
+    "For outside-project decisions, trust project_root/path_scope over folder-name heuristics. "
+    "If path_scope is in_project, do not classify high merely because the path is under ~/Downloads; "
+    "projects can live in Downloads. If path_scope is outside_project, treat that as outside the project.\n"
     "Levels:\n"
     '- low: read-only or trivially reversible (ls, cat, grep, git status, mkdir, touch, file reads).\n'
     '- medium: modifies state but contained/reversible (writing a single file, editing a file, cp, mv, '
@@ -1314,7 +1480,7 @@ def _assess_risk(action):
     ("high", "<error>") so the caller falls through to the prompt path."""
     payload = [
         {"role": "system", "content": RISK_SYSTEM},
-        {"role": "user", "content": action},
+        {"role": "user", "content": _risk_user_message(action)},
     ]
     attempts = max(0, RISK_CONNECTION_RETRIES) + 1
     try:
@@ -1479,29 +1645,75 @@ def _confirm(action):
 
 
 # --- text-fallback parsing --------------------------------------------------
-TOOL_TAG = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+TOOL_TAG_PATTERN = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
+MINION_TOOL_TAG_PATTERN = r"\[minion_tool_call\]\s*(\{.*?\})\s*\[/minion_tool_call\]"
+TOOL_TAG = re.compile(TOOL_TAG_PATTERN, re.DOTALL)
+MINION_TOOL_TAG = re.compile(MINION_TOOL_TAG_PATTERN, re.DOTALL)
+TOOL_TAGS = (MINION_TOOL_TAG, TOOL_TAG)  # prefer Minion's bracketed protocol; keep legacy support
+TOOL_PROTOCOL_TAG_RE = re.compile(r"</?tool_call\b[^>]*>")
+TOOL_RESULT_PROTOCOL_NOTE = (
+    "[minion note: escaped tool-call protocol delimiters from this tool result "
+    "before sending it back to the model]\n"
+)
 
 
 def parse_text_calls(content):
-    """Pull <tool_call>{...}</tool_call> blocks out of model text."""
+    """Pull standalone text-protocol tool-call messages.
+
+    Literal protocol tags can appear in files, docs, and code examples. Treat
+    them as executable only when the whole assistant message is protocol text.
+    """
+    text = content or ""
+    pos = 0
     calls = []
-    for m in TOOL_TAG.finditer(content or ""):
+    while pos < len(text):
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text):
+            break
+        match = None
+        for tag in TOOL_TAGS:
+            match = tag.match(text, pos)
+            if match:
+                break
+        if not match:
+            return []
         try:
-            obj = json.loads(m.group(1))
+            obj = json.loads(match.group(1))
             calls.append((obj["name"], obj.get("arguments", {})))
         except (json.JSONDecodeError, KeyError):
-            pass
+            return []
+        pos = match.end()
     return calls
 
 
+def _escape_tool_protocol_delimiters(text):
+    """Neutralize active tool-call delimiters in untrusted tool output."""
+    if not isinstance(text, str):
+        return text
+    safe = TOOL_PROTOCOL_TAG_RE.sub(
+        lambda m: m.group(0).replace("<", "&lt;").replace(">", "&gt;"),
+        text)
+    safe = safe.replace("[minion_tool_call]", "&#91;minion_tool_call&#93;")
+    safe = safe.replace("[/minion_tool_call]", "&#91;/minion_tool_call&#93;")
+    if safe != text:
+        return TOOL_RESULT_PROTOCOL_NOTE + safe
+    return text
+
+
 def _sanitize_tool_result(text):
-    """Collapse repetitive runs and cap size before a tool result enters the
-    message history. Large, near-duplicate tool outputs (find/ls/grep path
-    dumps) are the fuel for context-copying repetition collapse, so we (1)
-    collapse runs of >=3 identical consecutive lines, then (2) head/tail-cap to
-    TOOL_RESULT_CHARS with a visible marker. Short, non-repetitive results pass
-    through untouched, so normal file reads and command output are unaffected."""
-    if not isinstance(text, str) or len(text) <= 1000:
+    """Neutralize active protocol delimiters, dedup, and cap tool results.
+
+    Large, near-duplicate tool outputs (find/ls/grep path dumps) are the fuel
+    for context-copying repetition collapse, so we collapse runs of >=3
+    identical consecutive lines, then head/tail-cap to TOOL_RESULT_CHARS with a
+    visible marker. Short, non-repetitive results pass through except for
+    protocol-delimiter escaping.
+    """
+    if not isinstance(text, str):
+        return text
+    text = _escape_tool_protocol_delimiters(text)
+    if len(text) <= 1000:
         return text
     lines = text.split("\n")
     out_lines = []
@@ -2236,7 +2448,8 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     return TURN_DONE
 
 
-def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False):
+def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False,
+                         on_step=None):
     steps = 0
     reasoning_loop_cuts = 0
     malformed_stream_cuts = 0
@@ -2244,6 +2457,8 @@ def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False):
         status = model_turn(messages, reasoning_loop_cuts, malformed_stream_cuts,
                             forced_final=force_final,
                             recovery_sampling=recovery_sampling)
+        if on_step is not None:
+            on_step()
         force_final = False
         recovery_sampling = False
         if status == TURN_DONE:
@@ -2607,10 +2822,11 @@ def main():
                 _print_transcript(messages)
                 print(f"{DIM}  ──────────────{RESET}")
                 print()
-            # Restore the active source if the session recorded one.
+            # Restore the active source (and any model override) the session
+            # was started on, so a resume lands on the same endpoint + model.
             src_name = data.get("source")
-            if src_name and src_name in SOURCES and src_name != ACTIVE.name:
-                switch_source(src_name)
+            if src_name:
+                restore_source(src_name, model=data.get("model"))
             session_dirty = False  # just loaded — in sync with disk
         elif _resume_requested:
             print(f"{YELLOW}  ✗ no saved session found for {session_id!r}; "
@@ -2707,21 +2923,29 @@ def main():
                     mark = f"{GREEN}★{RESET}" if sname == ACTIVE.name else f"{DIM} ·{RESET}"
                     m = src.display_model()
                     print(f"  {mark} {CYAN}{sname:<12}{RESET} {DIM}{m} @ {src.base_url}{RESET}")
-                print(f"{DIM}  /source <name> to switch · context preserved (use /reset to clear){RESET}")
+                print(f"{DIM}  /source <name> [model] to switch · "
+                      "context preserved (use /reset to clear){RESET}")
             else:
                 target = sp[1]
+                # Optional second token: a model id to pin for this switch.
+                # Useful for multi-model hosts (e.g. Together) so you can do
+                #   /source together                    → default (GLM-5.2)
+                #   /source together zai-org/GLM-4.6     → that model, same host
+                # The override is non-sticky: a later bare /source <name>
+                # always falls back to the source's configured default.
+                model_override = sp[2] if len(sp) >= 3 else None
                 if target not in SOURCES:
                     avail = ", ".join(SOURCE_ORDER)
                     print(f"{RED}  ✗ unknown source {target!r} — available: {avail}{RESET}")
                     continue
-                if target == ACTIVE.name:
+                if target == ACTIVE.name and not model_override:
                     print(f"{DIM}  already on {target}{RESET}")
                     continue
-                switch_source(target)
+                switch_source(target, model_override=model_override)
                 src = SOURCES[target]
                 print(f"{BOLD}{YELLOW}  → switched to {target}{RESET} {DIM}({MODEL} @ {src.base_url}){RESET}")
                 print(_banner())
-                session_dirty = True  # source change is worth persisting
+                session_dirty = True  # source/model change is worth persisting
                 if _METRICS is not None:
                     _METRICS.model = MODEL
                     _METRICS.source = target
@@ -2777,7 +3001,8 @@ def main():
             content += "]"
             messages.append({"role": "user", "content": content})
             print(f"{YELLOW}  ↳ manual recovery requested — forcing visible checkpoint{RESET}")
-            _run_model_turn_loop(messages, force_final=True, recovery_sampling=True)
+            _run_model_turn_loop(messages, force_final=True, recovery_sampling=True,
+                                 on_step=_save_current)
             session_dirty = True
             continue
         if user in ("/compress", "/compact"):
@@ -2849,7 +3074,7 @@ def main():
             history.append(user)
         print()  # breathing room before the spinner/text starts
         messages.append({"role": "user", "content": user})
-        _run_model_turn_loop(messages)
+        _run_model_turn_loop(messages, on_step=_save_current)
         # Auto-save after the turn settles (whether it ended cleanly, hit the
         # step cap, or was escaped). This is the Hermes pattern: persist every
         # turn so a crash / accidental close never loses work.
@@ -3190,11 +3415,10 @@ def _cmd_resume(user, current_id):
     if not data:
         print(f"{YELLOW}  ✗ couldn't read session {sid}{RESET}")
         return None
-    # Reselect the recorded source if it's configured, so a resume lands on
-    # the same endpoint the session started on.
+    # Reselect the recorded source (and model override) if configured, so a
+    # resume lands on the same endpoint + model the session started on.
     src = data.get("source")
-    if src and src in SOURCES and src != ACTIVE.name:
-        switch_source(src)
+    if src and restore_source(src, model=data.get("model")):
         print(f"{BOLD}{YELLOW}  → source {src}{RESET} {DIM}({MODEL}){RESET}")
     n_msgs = len([m for m in data.get("messages", []) if m.get("role") != "system"])
     title = data.get("title") or "(untitled)"

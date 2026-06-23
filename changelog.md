@@ -2,6 +2,56 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Added — built-in `together` source + per-switch model override
+minion now ships a built-in `together` source for the Together AI API. When
+`TOGETHER_API_KEY` is set (in `~/.env` or the shell), a `together` source is
+auto-registered at `https://api.together.xyz/v1`, defaulting to the
+`zai-org/GLM-5.2` model. It's appended last, so it never displaces your
+default startup source — opt in with `/source together` or `--source together`.
+Defining your own `MINION_SOURCE_TOGETHER_*` vars overrides the built-in
+entirely.
+
+Because Together hosts many models, `/source` now takes an optional model
+argument so you can point a multi-model host at any of its models without a
+config edit:
+
+- `/source together` → GLM-5.2 (the source's configured default)
+- `/source together zai-org/GLM-4.6` → that model on the same endpoint
+
+The override is per-switch and non-sticky: a later bare `/source together`
+returns to the default. No model validation is done up front — a bad id is
+left for the server to reject. A model override is recorded in the session
+file alongside the source, so a `/resume` / `--resume` lands on the same
+endpoint **and** model.
+
+- `switch_source(name, model_override=None)` — optional model pin.
+- `restore_source(source_name, model=None)` — best-effort source + model
+  restore used by both resume paths.
+- `/source` listing line updated to advertise the `[model]` argument.
+
+### Fixed — tool-call delimiter injection from file/tool output
+Tool results now escape active tool-call protocol delimiters before they enter
+the next model context. This treats file contents and command output as
+untrusted input, so source code that happens to contain a tool-call-looking tag
+cannot be echoed back into an executable tool request.
+
+The preferred text fallback protocol is now
+`[minion_tool_call]...[/minion_tool_call]`; legacy `<tool_call>...</tool_call>`
+blocks are still parsed for compatibility, but only when the whole assistant
+message is standalone protocol text. Normal answers that quote source code,
+docs, or prompt text containing a valid-looking tool call remain plain text.
+
+### Fixed — risk classifier respects projects under `~/Downloads`
+Write/edit risk classification now sends structured cwd/project-root metadata
+to the classifier. The project root is the git root when available, otherwise
+the launch directory, and write/edit paths are tagged as `in_project` or
+`outside_project` before the model judges risk.
+
+This fixes the noisy approval case where editing
+`~/Downloads/<project>/file.py` was classified high just because the project
+lived under Downloads. Downloads still matters when the target is outside the
+active project root.
+
 ### Added — `/clear` and `/new` aliases for `/reset`
 `/clear` and `/new` now do the same thing as `/reset`: clear the in-memory
 context down to the system prompt and fork a fresh session id (so the old

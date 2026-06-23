@@ -9,6 +9,11 @@ def clear_minion_env():
     for k in list(os.environ):
         if k.startswith("MINION_"):
             del os.environ[k]
+    # Scrub the built-in `together` source's trigger key so tests that want a
+    # known, minimal source set aren't perturbed by a real ~/.env / shell
+    # export of TOGETHER_API_KEY. (Tests that exercise the together source
+    # set it explicitly.)
+    os.environ.pop("TOGETHER_API_KEY", None)
     # Prevent ~/.env from leaking real config into the tests. _load_env_file()
     # re-reads it on every reload, so point it at a nonexistent file.
     os.environ["MINION_ENV_FILE"] = "/dev/null"
@@ -104,6 +109,73 @@ banner = minion._banner()
 print("TEST 8: _banner() with multiple sources")
 print(f"  banner: {banner}")
 assert "zai" in banner
+print("  PASS\n")
+
+# --- Test 9: built-in `together` source auto-registers with a key ---
+clear_minion_env()
+sys.argv = ["minion.py"]
+os.environ["MINION_SOURCE_LOCAL_BASE_URL"] = "http://localhost:8080/v1"
+os.environ["TOGETHER_API_KEY"] = "fake-together-key"
+importlib.reload(minion)
+print("TEST 9: built-in together source auto-register")
+print(f"  SOURCE_ORDER: {minion.SOURCE_ORDER}")
+print(f"  together.base_url: {minion.SOURCES['together'].base_url}")
+print(f"  together.model: {minion.SOURCES['together'].model}")
+print(f"  together.api_key: {minion.SOURCES['together'].api_key}")
+assert "together" in minion.SOURCES, "together source should auto-register with a key"
+assert minion.SOURCES["together"].base_url == "https://api.together.xyz/v1"
+assert minion.SOURCES["together"].model == "zai-org/GLM-5.2", "default model should be GLM-5.2"
+assert minion.SOURCES["together"].api_key == "fake-together-key"
+# Registered last, so the first-defined source stays the startup default.
+assert minion.SOURCE_ORDER[0] == "local"
+assert minion.SOURCE_ORDER[-1] == "together"
+assert minion.ACTIVE.name == "local", "local should remain the default on load"
+print("  PASS\n")
+
+# --- Test 10: no together source without a key ---
+clear_minion_env()
+sys.argv = ["minion.py"]
+os.environ["MINION_SOURCE_LOCAL_BASE_URL"] = "http://localhost:8080/v1"
+importlib.reload(minion)
+print("TEST 10: no together source without TOGETHER_API_KEY")
+print(f"  SOURCE_ORDER: {minion.SOURCE_ORDER}")
+assert "together" not in minion.SOURCES, "no together source without a key"
+print("  PASS\n")
+
+# --- Test 11: explicit together config wins over the built-in ---
+clear_minion_env()
+sys.argv = ["minion.py"]
+os.environ["MINION_SOURCES"] = "together"
+os.environ["MINION_SOURCE_TOGETHER_BASE_URL"] = "https://my-proxy.example/v1"
+os.environ["MINION_SOURCE_TOGETHER_API_KEY"] = "custom-key"
+os.environ["MINION_SOURCE_TOGETHER_MODEL"] = "my-org/my-model"
+os.environ["TOGETHER_API_KEY"] = "fake-together-key"
+importlib.reload(minion)
+print("TEST 11: explicit together config overrides built-in")
+print(f"  together.base_url: {minion.SOURCES['together'].base_url}")
+print(f"  together.model: {minion.SOURCES['together'].model}")
+assert minion.SOURCES["together"].base_url == "https://my-proxy.example/v1"
+assert minion.SOURCES["together"].model == "my-org/my-model"
+assert minion.SOURCES["together"].api_key == "custom-key"
+print("  PASS\n")
+
+# --- Test 12: switch_source model override (per-switch model pin) ---
+clear_minion_env()
+sys.argv = ["minion.py"]
+os.environ["MINION_SOURCES"] = "together"
+os.environ["MINION_SOURCE_TOGETHER_BASE_URL"] = "https://api.together.xyz/v1"
+os.environ["MINION_SOURCE_TOGETHER_API_KEY"] = "k"
+os.environ["MINION_SOURCE_TOGETHER_MODEL"] = "zai-org/GLM-5.2"
+importlib.reload(minion)
+print("TEST 12: switch_source model_override")
+minion.switch_source("together")
+assert minion.MODEL == "zai-org/GLM-5.2", "bare switch → source default"
+# Override pins a different model for this switch.
+minion.switch_source("together", model_override="zai-org/GLM-4.6")
+assert minion.MODEL == "zai-org/GLM-4.6", "override should pin MODEL"
+# A bare switch afterward falls back to the configured default (non-sticky).
+minion.switch_source("together")
+assert minion.MODEL == "zai-org/GLM-5.2", "bare switch should restore default"
 print("  PASS\n")
 
 print("=" * 50)
