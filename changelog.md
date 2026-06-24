@@ -2,6 +2,84 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Added — max context window shown in the footer / `/source`
+The per-turn stats footer now shows the server's maximum context window next
+to the current context size — `ctx 12K/150K` instead of just `ctx 12K` — so
+you can see at a glance how much room is left. The limit is also shown in the
+`/source` listing (`· 150K ctx`) and on the `→ switched to …` line after a
+`/source` switch. This works for both backends the project ships against:
+
+- **llama.cpp (local):** read from `/v1/models` (`data[].meta.n_ctx`), with a
+  `/props` (`default_generation_settings.n_ctx`) fallback — the same endpoints
+  the model-name resolver already probes.
+- **Together (and any OpenAI-compat host that mirrors OpenAI's over-limit
+  wording):** when the models list is empty/unavailable, a one-token-prompt
+  request with a deliberately over-large `max_tokens` is rejected with a `400`
+  whose message names the limit ("This model's maximum context length is N
+  tokens…"); that's parsed. No tokens are generated (the request is rejected
+  before inference).
+
+New `Source.resolve_context_window()` tries these paths cheapest-first and
+caches the result per source (so each turn doesn't re-probe). The footer reads
+the cache and is **non-blocking**: on a cold source the max is omitted on the
+first turn and a background thread warms the cache, so it fills in on a later
+turn — Together's probe takes ~4s, which would be a jarring stall after the
+answer if it ran synchronously every turn. `switch_source()` clears the cache so
+a `/source <name> <model>` override re-probes against the new model id. A total
+miss degrades to the old `ctx N` footer (no `/<max>`).
+
+The current-context half of the field is **colorized by utilization** — green
+under 30%, yellow from 30–60%, red at 60%+ — so a glance tells you whether
+you're getting close to the limit; the max stays cyan and the `/` … ` ctx`
+separators are dimmed. When the max is unknown the field falls back to a plain
+uncolored `NNN ctx` and kicks off the background probe.
+
+New: `Source.resolve_context_window()` (+ `_ctx_from_models`,
+`_ctx_from_props`, `_ctx_from_overrun_probe`), `_ctx_field()` (the colored
+footer field), `_ensure_ctx_probe()`, `_CTX_PROBE_STARTED`, and a
+`_context_window` cache field on `Source`; `switch_source()` invalidates it on
+switch/override. `tests/test_context_window.py` pins all three probe paths,
+caching, cache-invalidation on switch, and the `_ctx_field()` colorization.
+
+### Fixed — agent silently stopping on empty turns (auto-continue)
+A model turn that produced **no content and no tool calls** used to return
+`TURN_DONE`, silently dropping the user to the chat prompt mid-task with no
+explanation. This happened most often right after a short or empty tool result
+(the classic case: a `grep` that exits cleanly with no matches), where the model
+"knows" the answer but emits zero tokens — a low-entropy attractor common with
+quantized local models (e.g. GLM-5.2 IQ4) on dense 50K+ contexts. It looked like
+the agent finished when it had actually gone mute.
+
+The turn loop now detects the empty turn and auto-recovers instead of stopping:
+
+- `model_turn` returns a new `TURN_EMPTY` status (when an assistant turn has no
+  text and no tool calls). The loop nudges the model — a `[Runtime note: …]` is
+  injected into the current user turn telling it to emit a tool call or a visible
+  answer — and retries with **recovery sampling** (more entropy, anti-repetition
+  knobs) to break out of the empty-output attractor. The dangling `tool` result is
+  preserved, so the retry has full context.
+- After `MINION_EMPTY_TURN_RETRIES` (default 3) consecutive empty turns, it
+  escalates to a **forced final answer** (`TURN_FORCE_FINAL`, the existing path),
+  so the agent either says something concrete or reports it's blocked rather than
+  spinning forever. A successful tool call resets the empty-turn counter (mirrors
+  the reasoning-loop / malformed-stream counters).
+- The path is fully opt-out: `MINION_EMPTY_TURN_RETRIES=0` restores the old
+  behavior (empty turn = done). Empty turns under `/recover` (forced-final) still
+  stop, since an empty forced answer already means "give up."
+
+New: `EMPTY_TURN_NUDGE`, `EMPTY_TURN_RETRY_LIMIT`, `TURN_EMPTY`, and
+`_last_is_dangling_tool()`; `_run_model_turn_loop` threads an `empty_turn_cuts`
+counter through `model_turn`. `tests/test_empty_turn_recovery.py` pins the
+behavior.
+
+### Fixed — `_interrupt_watcher` traceback under redirected stdin
+The Esc-watcher daemon thread called `sys.stdin.fileno()` before its `os.isatty`
+guard. Under a redirected/captured stdin (pytest, piped input) `fileno()` raises
+`UnsupportedOperation`, which surfaced as a noisy `PytestUnhandledThreadException`
+whenever `model_turn` ran in a test. The `fileno()` call is now wrapped so the
+watcher exits cleanly when stdin isn't a real fd — purely cosmetic, no behavior
+change in the REPL (where stdin is a tty).
+
 ### Added — built-in `together` source + per-switch model override
 minion now ships a built-in `together` source for the Together AI API. When
 `TOGETHER_API_KEY` is set (in `~/.env` or the shell), a `together` source is

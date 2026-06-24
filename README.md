@@ -114,7 +114,15 @@ MINION_SOURCE_ZAI_MODEL=glm-x-preview
 
 See [`sources.example.env`](sources.example.env) for a full annotated example.
 Switch at runtime with `/source [name]`. The conversation context is preserved
-across switches (use `/reset` if you want a clean slate).
+across switches (use `/reset` if you want a clean slate). Each source's maximum
+context window (the server's, for the active model) is shown in the `/source`
+list and on the switch line, and the per-turn stats footer shows it next to the
+current context size — `ctx 12K/150K` — so you can see how much room is left.
+The current half is colorized by how full the window is (green < 30%, yellow
+30–60%, red 60%+), so a glance tells you whether you're nearing the limit. For
+local llama.cpp the max is read from `/v1/models`/`/props`; for remote hosts
+like Together it's probed the first time it's needed (a deliberately over-sized
+request gets rejected with the limit named in the error), then cached.
 
 #### Built-in `together` source
 

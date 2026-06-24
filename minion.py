@@ -500,6 +500,12 @@ class Source:
         self.api_key = api_key or "sk-noop"
         self.model = model or None  # None → ask the server at resolve time
         self.client = OpenAI(base_url=base_url, api_key=self.api_key)
+        # Lazily-resolved max context window (in tokens) for the active model,
+        # or None when no probe could determine it. Cached after first success
+        # so the footer + /source list don't re-hit the network each turn.
+        # Call resolve_context_window(force=True) to re-probe (e.g. after a
+        # /source <name> <model> override pins a different model id).
+        self._context_window = None
 
     # Server-advertised ids that carry no real identity — when /v1/models
     # returns one of these (bare llama.cpp with no --alias, or a generic
@@ -544,6 +550,143 @@ class Source:
 
     def display_model(self):
         return self.model or "auto"
+
+    # Regex for the provider-agnostic context-limit probe: Together (and any
+    # OpenAI-compat backend that mirrors OpenAI's error wording) rejects an
+    # over-large request with "This model's maximum context length is N tokens,
+    # but the request …". We send a deliberately over-sized max_tokens with a
+    # one-token prompt so the server tells us N without us ever generating.
+    _CTX_LIMIT_RE = re.compile(r"maximum context length is (\d+) tokens", re.IGNORECASE)
+
+    def resolve_context_window(self, model=None, force=False):
+        """Best-effort max context window (tokens) for `model` on this source.
+
+        Returns the cached value if present (unless force=True), else probes
+        and caches. Never raises — any failure returns None and the footer
+        just omits the "/<max>" suffix. Probing order, cheapest first:
+
+          1. /v1/models — llama.cpp puts n_ctx in data[0].meta; some OpenAI-
+             compat hosts put context_length on the model object directly.
+          2. /props (llama.cpp root) — default_generation_settings.n_ctx.
+          3. Over-max_tokens chat probe — send max_tokens far beyond any real
+             context with a 1-token prompt; parse the 400's "maximum context
+             length is N tokens" message (works for Together and any host that
+             mirrors OpenAI's over-limit wording). One request, no generation.
+
+        `model` defaults to the source's configured model, falling back to a
+        live resolve_model() so an auto source is probed against the model it
+        will actually use. The result is keyed to that model id, so a
+        /source <name> <other-model> override should call with force=True.
+
+        A single probe attempt can hit a transient error — most notably
+        llama.cpp's 503 "Loading model" while the weights are still being
+        mmapped, which blocks /v1/models AND /props even though a chat slot
+        may already be serving. So a failed attempt does NOT cache None;
+        the caller (footer/listing) re-arms the probe on a later turn until
+        it resolves. Use force=True to retry immediately (e.g. an explicit
+        /source switch the user is waiting on)."""
+        if not force and self._context_window is not None:
+            return self._context_window
+        mid = model or self.model or self.resolve_model()
+        n = self._ctx_from_models(mid) or self._ctx_from_props()
+        if n is None:
+            n = self._ctx_from_overrun_probe(mid)
+        if isinstance(n, int) and n > 0:
+            self._context_window = n
+        # NOTE: a miss does NOT set _context_window — stays None so the
+        # footer re-probes next turn (the server may have finished loading).
+        return self._context_window
+
+    def _ctx_from_models(self, mid):
+        """Pull n_ctx / context_length from GET /v1/models. llama.cpp stashes
+        it under data[0].meta.n_ctx; some generic hosts expose context_length
+        as a top-level model field. Returns int or None."""
+        try:
+            data = self.client.models.list(timeout=10).data
+        except Exception:
+            return None
+        # Prefer the entry whose id matches the active model (multi-model
+        # hosts), else the first. Match loosely on a trailing token so a full
+        # path id ("…/GLM-5.2-…gguf") still hits a short alias ("GLM-5.2").
+        pick = None
+        if mid:
+            mtail = mid.rsplit("/", 1)[-1].lower()
+            for m in data:
+                if (m.id or "").lower() == mid.lower() or \
+                   (m.id or "").rsplit("/", 1)[-1].lower() == mtail:
+                    pick = m
+                    break
+        if pick is None and data:
+            pick = data[0]
+        if pick is None:
+            return None
+        # OpenAI SDK preserves unknown fields in __pydantic_extra__.
+        extra = getattr(pick, "__pydantic_extra__", None) or {}
+        meta = extra.get("meta") if isinstance(extra, dict) else None
+        if isinstance(meta, dict):
+            for k in ("n_ctx", "context_length", "context_window",
+                      "max_context_length", "max_input_tokens"):
+                v = meta.get(k)
+                if isinstance(v, int) and v > 0:
+                    return v
+        # Some hosts put it directly on the model object (OpenAI-compat extra).
+        for k in ("context_length", "context_window", "max_context_length",
+                  "max_input_tokens", "max_tokens"):
+            v = extra.get(k) if isinstance(extra, dict) else None
+            if v is None:
+                v = getattr(pick, k, None)
+            if isinstance(v, int) and v > 0:
+                return v
+        return None
+
+    def _ctx_from_props(self):
+        """llama.cpp /props fallback: default_generation_settings.n_ctx."""
+        try:
+            root = re.sub(r"/v\d+/?$", "", self.base_url.rstrip("/"))
+            with urllib.request.urlopen(root + "/props", timeout=5) as r:
+                props = json.loads(r.read().decode("utf-8"))
+        except Exception:
+            return None
+        dgs = props.get("default_generation_settings")
+        if isinstance(dgs, dict):
+            for k in ("n_ctx", "context_length", "context_window"):
+                v = dgs.get(k)
+                if isinstance(v, int) and v > 0:
+                    return v
+        # Some builds put n_ctx at the top level of /props.
+        for k in ("n_ctx", "context_length", "context_window"):
+            v = props.get(k)
+            if isinstance(v, int) and v > 0:
+                return v
+        return None
+
+    def _ctx_from_overrun_probe(self, mid):
+        """Send a chat completion with max_tokens far beyond any real context
+        and a 1-token prompt; parse the 400's "maximum context length is N
+        tokens" message. Works for Together and any host mirroring OpenAI's
+        over-limit wording. No tokens are generated (the request is rejected
+        before inference). Returns int or None."""
+        if not mid:
+            return None
+        try:
+            self.client.chat.completions.create(
+                model=mid,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=10_000_000,
+                stream=False,
+                timeout=30,
+            )
+        except Exception as e:
+            msg = str(e)
+            body = getattr(e, "body", None)
+            if isinstance(body, dict):
+                # Together nests it under body["message"]["message"]; OpenAI
+                # under body["error"]["message"]. Flatten to a string search.
+                msg = json.dumps(body) + " " + msg
+            m = self._CTX_LIMIT_RE.search(msg)
+            if m:
+                return int(m.group(1))
+        return None
 
 
 def _resolve_api_key(val):
@@ -639,6 +782,10 @@ def switch_source(name, model_override=None):
     ACTIVE = src
     client = src.client
     MODEL = model_override if model_override else src.resolve_model()
+    # A model change (different source, or a per-switch model override on a
+    # multi-model host like Together) means the cached max-context may no longer
+    # apply — drop it so the footer re-probes against the new model next turn.
+    src._context_window = None
     return True
 
 
@@ -904,7 +1051,10 @@ def _interrupt_watcher():
     _INTERRUPT_EVENT, then returns. Exits when _INTERRUPT_EVENT is set by
     main's cleanup. Restores termios on exit.
     """
-    fd = sys.stdin.fileno()
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        return  # stdin has no fileno (pytest capture, redirect, etc.)
     if not os.isatty(fd):
         return
     try:
@@ -1332,6 +1482,14 @@ DESC_SYSTEM = (
 REASONING_ONLY_RETRY_LIMIT = _env_int("MINION_REASONING_ONLY_RETRIES", 1)
 MALFORMED_STREAM_RETRY_LIMIT = _env_int("MINION_MALFORMED_STREAM_RETRIES", 2)
 FORCED_FINAL_MAX_TOKENS = _env_int("MINION_FORCED_FINAL_MAX_TOKENS", 2048)
+# An empty assistant turn (no content, no tool calls) is a silent stall: the model
+# produced nothing and the loop would otherwise return TURN_DONE, dropping the user
+# to the chat prompt mid-task. That's confusing — it looks like the agent finished
+# when it actually just went mute (common with quantized models on a short/empty
+# tool result, where the model "knows" the answer but emits no tokens). Auto-nudge
+# it back into producing either a tool call or a visible answer. 0 disables the
+# auto-continue (an empty turn then drops to chat as before).
+EMPTY_TURN_RETRY_LIMIT = _env_int("MINION_EMPTY_TURN_RETRIES", 3)
 RUNTIME_NOTE_RE = re.compile(r"\n\n\[Runtime note: .*?\]\s*$", re.DOTALL)
 
 FORCED_FINAL_NUDGE = (
@@ -1339,6 +1497,12 @@ FORCED_FINAL_NUDGE = (
     "private reasoning. Use the final_answer tool if available. Return a complete "
     "visible answer now in at most six short bullets or paragraphs. If you are "
     "blocked, say exactly what is blocking you and what input is needed."
+)
+EMPTY_TURN_NUDGE = (
+    "Your previous response was empty — you produced no visible text and no tool "
+    "call, so nothing happened. Do not stop. If the task is not finished, emit the "
+    "next tool call now. If you have everything you need, use the final_answer tool "
+    "(or reply with a concise visible answer). Do not repeat the empty turn."
 )
 MANUAL_RECOVERY_NUDGE = (
     "Manual recovery requested by the user because the previous response appeared "
@@ -1359,6 +1523,17 @@ def _nudge_current_user_turn(messages, nudge):
         msg["content"] = f"{content}\n\n{note}" if content else note
         return
     messages.append({"role": "user", "content": note})
+
+
+def _last_is_dangling_tool(messages):
+    """True if the last message is a `tool` result with no assistant turn after it.
+
+    This is the layout right after a tool ran and before the model follows up: an
+    empty assistant turn here is most suspicious — the model produced nothing in
+    response to a fresh tool result, so the user sees the agent "finish" with no
+    answer. Auto-continue is most warranted in exactly this case.
+    """
+    return bool(messages) and messages[-1].get("role") == "tool"
 
 
 # --- risk classifier --------------------------------------------------------
@@ -2028,12 +2203,84 @@ TURN_DONE = "done"
 TURN_TOOL = "tool"
 TURN_STREAM_CUT = "stream_cut"
 TURN_FORCE_FINAL = "force_final"
+TURN_EMPTY = "empty"  # assistant emitted no content and no tool calls → silent stall
 TURN_ESC = "esc"  # user pressed Esc at an approval prompt → drop to chat input
+
+
+def _ctx_field(prompt_n):
+    """The colored `ctx` field for the stats footer: `<cur>/<max> ctx`.
+    The max context window is cyan; the current context is colored by
+    utilization — green under 30%, yellow under 60%, red at or above.
+    When the max isn't known yet (probe still pending or unreachable)
+    the field degrades to `<cur> ctx` with no color, and a background
+    probe is kicked off so a later turn can fill in the max."""
+    cur = _abbr(prompt_n)
+    if ACTIVE is None:
+        return f"{cur} ctx"
+    mx = ACTIVE._context_window
+    if not isinstance(mx, int) or mx <= 0:
+        _ensure_ctx_probe(ACTIVE)
+        return f"{cur} ctx"
+    mx_s = _abbr(mx)
+    ratio = prompt_n / mx if mx > 0 else 0.0
+    if ratio < 0.30:
+        color = GREEN
+    elif ratio < 0.60:
+        color = YELLOW
+    else:
+        color = RED
+    # RESET after each colored run, then re-apply DIM so the rest of the
+    # footer (joined around this field) stays dim.
+    return f"{color}{cur}{RESET}{DIM}/{CYAN}{mx_s}{RESET}{DIM} ctx"
+
+
+_CTX_PROBE_STARTED = set()  # id(Source) currently being probed (avoid dupe threads)
+
+
+def _ensure_ctx_probe(src):
+    """Start a background thread to resolve a Source's max context window if
+    it isn't already known and no probe is in flight for it. The result lands
+    in src._context_window; the footer picks it up on a later turn. Idempotent
+    via _CTX_PROBE_STARTED (cleared when the thread finishes).
+
+    A local server's metadata endpoints can 503 "Loading model" for tens of
+    seconds at cold start (the weights are still mmapping) even while a chat
+    slot is already serving — so a single attempt often misses. The thread
+    retries with backoff until it resolves (or gives up after ~2 min), so the
+    suffix fills in the first turn AFTER the server is ready rather than
+    depending on the user to keep typing."""
+    sid = id(src)
+    if sid in _CTX_PROBE_STARTED:
+        return
+    _CTX_PROBE_STARTED.add(sid)
+
+    def _work():
+        # Backoff schedule (seconds between attempts): a handful of quick
+        # tries for a fast local server, then wider spacing for a slow cold
+        # start. Total ~2 min of probing before giving up (the footer will
+        # re-arm on the next user turn anyway, so this is just a best effort
+        # to resolve the max before the user has to wait for another turn).
+        delays = [1, 2, 3, 5, 8, 10, 15, 20, 25, 30, 30]
+        try:
+            for delay in delays:
+                if isinstance(src._context_window, int) and src._context_window > 0:
+                    return  # resolved by another path (e.g. a /source switch)
+                src.resolve_context_window()
+                if isinstance(src._context_window, int) and src._context_window > 0:
+                    return
+                time.sleep(delay)
+        except Exception:
+            pass  # never raise from a background probe
+        finally:
+            _CTX_PROBE_STARTED.discard(sid)
+
+    t = threading.Thread(target=_work, daemon=True, name="minion-ctx-probe")
+    t.start()
 
 
 # --- one model turn (streamed), returns TURN_* status -----------------------
 def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=0,
-               forced_final=False, recovery_sampling=False):
+               empty_turn_count=0, forced_final=False, recovery_sampling=False):
     # Start the spinner BEFORE open_stream() so the HTTP-handshake + interrupt-
     # watcher-setup window (which can be tens of ms on a warm local server but
     # seconds on a cold/wake-from-sleep one) isn't a frozen green-text gap.
@@ -2300,10 +2547,9 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         _METRICS.add(_normalize_usage(usage, timings))
     if timings and timings.get("predicted_n"):
         prompt_n = timings.get("prompt_n", 0)
-        cache_n = timings.get("cache_n", 0)
         gen_n = timings["predicted_n"]
         tps = timings.get("predicted_per_second", 0)
-        ctx = f"ctx {_abbr(prompt_n)}+{_abbr(cache_n)} cached" if cache_n else f"ctx {_abbr(prompt_n)}"
+        ctx = _ctx_field(prompt_n)
         prompt_ms = timings.get("prompt_ms", 0)
         ttft = (prompt_ms / 1000.0) if prompt_ms else t_first
         parts = [f"{gen_n} tok", f"{tps:5.1f} tok/s", ctx]
@@ -2314,15 +2560,8 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     elif usage and (usage.completion_tokens or 0):
         gen_n = usage.completion_tokens or 0
         prompt_n = usage.prompt_tokens or 0
-        cache_n = getattr(usage, "prompt_tokens_details", None)
-        cached = None
-        if cache_n is not None:
-            cached = getattr(cache_n, "cached_tokens", None)
         tps = gen_n / elapsed if elapsed > 0 else 0
-        if cached:
-            ctx = f"ctx {_abbr(prompt_n)}+{_abbr(cached)} cached"
-        else:
-            ctx = f"ctx {_abbr(prompt_n)}"
+        ctx = _ctx_field(prompt_n)
         parts = [f"{gen_n} tok", f"{tps:5.1f} tok/s", ctx]
         if t_first:
             parts.append(f"{t_first*1000:4.0f}ms ttft")
@@ -2443,6 +2682,32 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         return TURN_DONE
 
     if not text.strip():
+        # Silent stall: the model emitted nothing. In a real agentic loop this is
+        # almost never a legitimate "done" — it usually follows a short/empty
+        # tool result (the model "knows" the answer but produces no tokens), and
+        # returning TURN_DONE here drops the user to the chat prompt mid-task with
+        # no explanation. Surface it so the loop can nudge + auto-continue instead.
+        #
+        # Never auto-continue when:
+        #   • forced_final — an empty forced answer already means "give up" (the
+        #     forced-final block above printed its own message); stopping is right.
+        #   • EMPTY_TURN_RETRY_LIMIT <= 0 — the user opted out; empty = done.
+        #   • recovery already exhausted the budget — escalate to a forced answer
+        #     (mirrors the reasoning-loop path) instead of spinning forever.
+        if (not forced_final and EMPTY_TURN_RETRY_LIMIT > 0
+                and empty_turn_count < EMPTY_TURN_RETRY_LIMIT):
+            dangling = _last_is_dangling_tool(messages)
+            print(f"{YELLOW}  ✂ EMPTY TURN — no content and no tool call"
+                  f"{'; dangling tool result awaits a follow-up' if dangling else ''}"
+                  f"; nudging the model to continue "
+                  f"({empty_turn_count + 1}/{EMPTY_TURN_RETRY_LIMIT}){RESET}")
+            _nudge_current_user_turn(messages, EMPTY_TURN_NUDGE)
+            return TURN_EMPTY
+        if not forced_final and EMPTY_TURN_RETRY_LIMIT > 0:
+            print(f"{YELLOW}  ✂ EMPTY TURN — no content after {empty_turn_count} nudge"
+                  f"{'s' if empty_turn_count != 1 else ''}; forcing a final answer{RESET}")
+            _nudge_current_user_turn(messages, FORCED_FINAL_NUDGE)
+            return TURN_FORCE_FINAL
         return TURN_DONE
     messages.append({"role": "assistant", "content": text})
     return TURN_DONE
@@ -2453,8 +2718,10 @@ def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False,
     steps = 0
     reasoning_loop_cuts = 0
     malformed_stream_cuts = 0
+    empty_turn_cuts = 0
     while steps < 25:  # cap runaway tool/retry loops
         status = model_turn(messages, reasoning_loop_cuts, malformed_stream_cuts,
+                            empty_turn_count=empty_turn_cuts,
                             forced_final=force_final,
                             recovery_sampling=recovery_sampling)
         if on_step is not None:
@@ -2470,14 +2737,20 @@ def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False,
             malformed_stream_cuts += 1
             recovery_sampling = True
             continue
+        if status == TURN_EMPTY:
+            empty_turn_cuts += 1
+            recovery_sampling = True  # more entropy to escape the empty-output attractor
+            continue
         if status == TURN_FORCE_FINAL:
             reasoning_loop_cuts += 1
+            empty_turn_cuts = 0  # handed off to the forced-final path; reset
             force_final = True
             recovery_sampling = True
             continue
         if status == TURN_TOOL:
             reasoning_loop_cuts = 0
             malformed_stream_cuts = 0
+            empty_turn_cuts = 0
             continue
 
 
@@ -2781,6 +3054,15 @@ def main():
     # The banner is printed at startup and after source/approval changes.
     print(_banner())
     print()
+    # Warm the active source's max-context-window cache before the first
+    # prompt: the probe (esp. on a still-loading local server, whose /v1/models
+    # + /props 503 while mmapping) can take seconds-to-tens-of-seconds, but the
+    # user typically spends that long typing their first message — so by the
+    # time turn 1 finishes the cache is often already filled and the footer
+    # shows the "/<max>" suffix immediately instead of a turn later. Background,
+    # non-blocking; degrades to "no suffix" if it never resolves.
+    if ACTIVE is not None:
+        _ensure_ctx_probe(ACTIVE)
     messages = [{"role": "system", "content": SYSTEM}]
     history = []  # past user submissions, newest last; Up/Down navigates
 
@@ -2922,7 +3204,13 @@ def main():
                     src = SOURCES[sname]
                     mark = f"{GREEN}★{RESET}" if sname == ACTIVE.name else f"{DIM} ·{RESET}"
                     m = src.display_model()
-                    print(f"  {mark} {CYAN}{sname:<12}{RESET} {DIM}{m} @ {src.base_url}{RESET}")
+                    ctx = src._context_window
+                    if isinstance(ctx, int) and ctx > 0:
+                        ctx_s = f" · {_abbr(ctx)} ctx"
+                    else:
+                        ctx_s = ""
+                        _ensure_ctx_probe(src)  # warm the cache for next time
+                    print(f"  {mark} {CYAN}{sname:<12}{RESET} {DIM}{m} @ {src.base_url}{ctx_s}{RESET}")
                 print(f"{DIM}  /source <name> [model] to switch · "
                       "context preserved (use /reset to clear){RESET}")
             else:
@@ -2943,7 +3231,13 @@ def main():
                     continue
                 switch_source(target, model_override=model_override)
                 src = SOURCES[target]
-                print(f"{BOLD}{YELLOW}  → switched to {target}{RESET} {DIM}({MODEL} @ {src.base_url}){RESET}")
+                # An explicit /source switch is user-initiated, so a synchronous
+                # probe here is the right trade: the user asked for this source
+                # and will want to see its context limit. Caches after the first
+                # switch, so later switches to a known source are instant.
+                ctx = src.resolve_context_window()
+                ctx_s = f" · {_abbr(ctx)} ctx" if isinstance(ctx, int) and ctx > 0 else ""
+                print(f"{BOLD}{YELLOW}  → switched to {target}{RESET} {DIM}({MODEL} @ {src.base_url}{ctx_s}){RESET}")
                 print(_banner())
                 session_dirty = True  # source/model change is worth persisting
                 if _METRICS is not None:
