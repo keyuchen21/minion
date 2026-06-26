@@ -514,6 +514,41 @@ class Source:
     # saved sessions don't all collapse into a meaningless "local-model".
     _GENERIC_MODEL_IDS = {"local-model", "model", "auto", "unknown", "gpt-3.5-turbo"}
 
+    @staticmethod
+    def _clean_model_id(advertised):
+        """Shorten a server-advertised model id into a concise display name.
+
+        Only touches local-server ids that look like file paths (llama.cpp,
+        Ollama, …) where /v1/models returns the full GGUF/HF file path. Remote
+        API ids in org/model form (e.g. "zai-org/GLM-5.2") are returned
+        unchanged.
+
+        Examples:
+          /media/h/.../GLM-5.2-GGUF/UD-IQ4_NL/GLM-5.2-UD-IQ4_NL-00001-of-00009.gguf
+            → GLM-5.2-UD-IQ4_NL
+          /models/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf
+            → Meta-Llama-3-8B-Instruct-Q4_K_M
+        Anything that doesn't look like a local model file path is returned
+        as-is so we never mangle a legitimate remote model id.
+        """
+        if not advertised:
+            return advertised
+        # Only clean up local file paths — ones that end in a model file
+        # extension. Anything else (org/model, bare names) is passed through.
+        lower = advertised.lower()
+        if not any(lower.endswith(ext) for ext in (".gguf", ".bin", ".safetensors")):
+            return advertised
+        name = advertised.rsplit("/", 1)[-1]
+        # Strip shard suffix on multi-file quantizations
+        # (e.g. "-00001-of-00009")
+        name = re.sub(r"-\d{5}-of-\d{5}(?=$|\.)", "", name)
+        # Strip extension
+        for ext in (".gguf", ".bin", ".safetensors"):
+            if name.lower().endswith(ext):
+                name = name[: -len(ext)]
+                break
+        return name
+
     def resolve_model(self):
         if self.model:
             return self.model
@@ -523,7 +558,7 @@ class Source:
         except Exception:
             advertised = None
         if advertised and advertised.strip().lower() not in self._GENERIC_MODEL_IDS:
-            return advertised
+            return self._clean_model_id(advertised)
         # The endpoint gave us nothing useful. Many local servers (llama.cpp's
         # llama-server) expose the actually-loaded model file at /props even
         # when /v1/models only advertises a generic id — recover the real name
