@@ -35,11 +35,16 @@ Sessions — every chat is auto-saved to ~/.minion/sessions/ and resumable:
   /resume <n|short-id|title>      # switch to another session mid-chat
   /save [title]                   # save the current session (title optional)
 
-Toggles in-session: /source [name] [model]  /yolo  /approval [level]  /compress  /compact  /autocompress [pct|off|on]  /reset  /clear  /new  /recover  /sessions  /resume  /save  /delete  /quit
+Toggles in-session: /source [name] [model]  /provider [source] [a,b,…|off]  /yolo  /approval [level]  /compress  /compact  /autocompress [pct|off|on]  /reset  /clear  /new  /recover  /sessions  /resume  /save  /delete  /quit
 Flags: --yolo  --approval <all|low|medium|high|yolo>  --source <name>  --resume <target>  --session <id>
 Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval mode; ~/.env or shell)
        MINION_AUTOCOMPRESS_PERCENT=<0-100>  (auto-compress threshold; 0=off; default 85)
+       MINION_BACKEND=vllm  (disables llama.cpp-only recovery knobs like min_p /
+                             repeat_penalty / DRY that vLLM's speculative decoder
+                             rejects; omits them from extra_body on retries)
        TOGETHER_API_KEY  (auto-registers a built-in `together` source; default model zai-org/GLM-5.2)
+       OPENROUTER_API_KEY  (auto-registers a built-in `openrouter` source; default model z-ai/glm-5.2,
+            routed to parasail/fp8 — override with /provider or MINION_SOURCE_OPENROUTER_EXTRA_BODY)
 """
 import json
 import os
@@ -422,7 +427,8 @@ def _maybe_refresh_description(session_id, messages):
         _log_event("req", {"model": MODEL, "messages": payload,
                            "stream": False, "_purpose": "session_desc"})
         resp = client.chat.completions.create(
-            model=MODEL, messages=payload, stream=False, timeout=20)
+            model=MODEL, messages=payload, stream=False, timeout=20,
+            **(ACTIVE.extra_request_kwargs() if ACTIVE else {}))
         try:
             _log_event("resp", {"_purpose": "session_desc", "data": resp.model_dump()})
         except Exception:
@@ -495,18 +501,50 @@ def _resolve_session(target, sessions=None):
 # Switch at runtime with /source.
 
 class Source:
-    def __init__(self, name, base_url, api_key, model=None):
+    def __init__(self, name, base_url, api_key, model=None, extra_body=None,
+                 http_headers=None):
         self.name = name
         self.base_url = base_url
         self.api_key = api_key or "sk-noop"
         self.model = model or None  # None → ask the server at resolve time
-        self.client = OpenAI(base_url=base_url, api_key=self.api_key)
+        # Default HTTP headers sent on every request. Used by aggregators like
+        # OpenRouter which read HTTP-Referer (your site URL) and X-Title (your
+        # app name) to identify the calling app in their dashboard. Ignored by
+        # non-consumers (llama.cpp, Together, …) so it's safe to always pass.
+        self.http_headers = http_headers or None
+        client_kwargs = {"base_url": base_url, "api_key": self.api_key}
+        if self.http_headers:
+            client_kwargs["default_headers"] = self.http_headers
+        self.client = OpenAI(**client_kwargs)
         # Lazily-resolved max context window (in tokens) for the active model,
         # or None when no probe could determine it. Cached after first success
         # so the footer + /source list don't re-hit the network each turn.
         # Call resolve_context_window(force=True) to re-probe (e.g. after a
         # /source <name> <model> override pins a different model id).
         self._context_window = None
+        # Per-request body fields the OpenAI SDK doesn't accept as kwargs, merged
+        # into every chat.completions.create() call via extra_body. The canonical
+        # use is OpenRouter provider routing — a `provider` object whose `order`
+        # picks which upstream serves a given model id (different providers back
+        # the same endpoint at different prices / precisions / latencies):
+        #
+        #   {"provider": {"order": ["parasail/fp8"], "allow_fallbacks": false,
+        #                 "require_parameters": true, "data_collection": "deny"}}
+        #
+        # For local servers (llama.cpp) this is empty and contributes nothing;
+        # unknown keys are silently ignored by non-consumers, so it's safe to
+        # always pass it through. Set via MINION_SOURCE_<NAME>_EXTRA_BODY (a JSON
+        # string) or the /provider slash command (ephemeral, per-session).
+        self.extra_body = extra_body or None
+
+    def extra_request_kwargs(self):
+        """extra_body kwarg to merge into every chat.completions.create(), or
+        {} when none is configured. Non-consumers ignore unknown body keys, so
+        this is a no-op for backends that don't understand it (llama.cpp,
+        Together, …)."""
+        if not self.extra_body:
+            return {}
+        return {"extra_body": dict(self.extra_body)}
 
     # Server-advertised ids that carry no real identity — when /v1/models
     # returns one of these (bare llama.cpp with no --alias, or a generic
@@ -702,7 +740,7 @@ class Source:
                     return v
         # Some hosts put it directly on the model object (OpenAI-compat extra).
         for k in ("context_length", "context_window", "max_context_length",
-                  "max_input_tokens", "max_tokens"):
+                  "max_input_tokens", "max_tokens", "max_model_len"):
             v = extra.get(k) if isinstance(extra, dict) else None
             if v is None:
                 v = getattr(pick, k, None)
@@ -767,6 +805,55 @@ def _resolve_api_key(val):
     return val
 
 
+def _parse_extra_body(raw):
+    """Parse a MINION_SOURCE_<NAME>_EXTRA_BODY env value into a dict, or None.
+
+    Accepts a JSON object string and merges it into every chat request as the
+    OpenAI SDK's `extra_body` — the canonical channel for fields the SDK doesn't
+    model as top-level kwargs. The primary use case is OpenRouter provider
+    routing (a `provider` object whose `order` picks which upstream serves a
+    model id). Returns None on a blank/invalid value (with a stderr warning on
+    bad JSON) so a typo never silently drops routing — it fails loudly at load.
+
+    Example:
+        MINION_SOURCE_OR_EXTRA_BODY={"provider":{"order":["parasail/fp8"],"allow_fallbacks":false}}
+    """
+    if not raw or not raw.strip():
+        return None
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(
+            f"minion: ignoring bad MINION_*_EXTRA_BODY JSON ({e.msg} at "
+            f"char {e.pos}); provider routing is NOT set\n")
+        return None
+    if isinstance(obj, dict) and obj:
+        return obj
+    if isinstance(obj, dict):
+        return None  # empty object {} → no routing, same as unset
+    sys.stderr.write(
+        "minion: MINION_*_EXTRA_BODY must be a JSON object, ignoring "
+        f"(got {type(obj).__name__}); provider routing is NOT set\n")
+    return None
+
+
+def _build_http_headers(app_name=None, app_url=None):
+    """Build default HTTP headers for API requests, for aggregators like
+    OpenRouter which read HTTP-Referer (your site URL) and X-Title (your app
+    name) to identify the calling app in their dashboard.
+
+    Set via MINION_SOURCE_<NAME>_APP_NAME and MINION_SOURCE_<NAME>_APP_URL.
+    Returns None when neither is provided so the OpenAI client is constructed
+    without default_headers (no overhead for non-aggregator sources).
+    """
+    headers = {}
+    if app_url:
+        headers["HTTP-Referer"] = app_url
+    if app_name:
+        headers["X-Title"] = app_name
+    return headers or None
+
+
 def _discover_sources():
     """Build SOURCES + SOURCE_ORDER from MINION_SOURCE_* env vars, falling
     back to a single 'local' source from the legacy MINION_* vars."""
@@ -789,7 +876,16 @@ def _discover_sources():
             continue
         api_key = _resolve_api_key(os.environ.get(p + "API_KEY"))
         model = os.environ.get(p + "MODEL")
-        src = Source(name, base_url, api_key, model)
+        extra_body = _parse_extra_body(os.environ.get(p + "EXTRA_BODY"))
+        # HTTP headers for aggregators like OpenRouter: HTTP-Referer (site
+        # URL) and X-Title (app name) identify the calling app in their
+        # dashboard. Set via MINION_SOURCE_<NAME>_APP_NAME /
+        # MINION_SOURCE_<NAME>_APP_URL.
+        http_headers = _build_http_headers(
+            os.environ.get(p + "APP_NAME"),
+            os.environ.get(p + "APP_URL"))
+        src = Source(name, base_url, api_key, model, extra_body=extra_body,
+                     http_headers=http_headers)
         SOURCES[name] = src
         SOURCE_ORDER.append(name)
     if not SOURCES:
@@ -820,6 +916,43 @@ def _discover_sources():
                 "zai-org/GLM-5.2",  # default model; override per-switch via /source together <model>
             )
             SOURCE_ORDER.append("together")
+
+    # Built-in convenience source: OpenRouter. Like Together it's a multi-model
+    # host (you address any model by id), so it only registers when a key is
+    # available and only when the user hasn't defined an "openrouter" source
+    # themselves (an explicit MINION_SOURCE_OPENROUTER_* config always wins).
+    # Registered last, so it never displaces the user's default startup source —
+    # opt in with `/source openrouter` (or `--source openrouter`).
+    #
+    # The difference from Together is provider routing: OpenRouter fronts many
+    # upstream providers behind one model id, each with its own price / precision
+    # / latency / data-collection policy. Routing rides in the request body as a
+    # `provider` object (extra_body), so the built-in seeds it from
+    # MINION_SOURCE_OPENROUTER_EXTRA_BODY (a JSON string) if present, and the
+    # ephemeral /provider command can override it per-session. The default model
+    # is z-ai/glm-5.2; the default routing pins parasail/fp8 — cheap, fast, and a
+    # deliberate single-provider choice so you know exactly what's serving you.
+    if "openrouter" not in SOURCES:
+        or_key = _resolve_api_key(os.environ.get("OPENROUTER_API_KEY", ""))
+        if or_key:
+            or_body = _parse_extra_body(
+                os.environ.get("MINION_SOURCE_OPENROUTER_EXTRA_BODY", ""))
+            if or_body is None:
+                or_body = {"provider": {"order": ["parasail/fp8"],
+                                        "allow_fallbacks": False}}
+            or_headers = _build_http_headers(
+                os.environ.get("MINION_SOURCE_OPENROUTER_APP_NAME", "Minion"),
+                os.environ.get("MINION_SOURCE_OPENROUTER_APP_URL",
+                               "https://github.com/Sentdex/minion"))
+            SOURCES["openrouter"] = Source(
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                or_key,
+                "z-ai/glm-5.2",  # default model; override via /source openrouter <model>
+                extra_body=or_body,
+                http_headers=or_headers,
+            )
+            SOURCE_ORDER.append("openrouter")
 
 
 SOURCES = {}        # name → Source
@@ -881,6 +1014,52 @@ def restore_source(source_name, model=None):
         return True
     switch_source(source_name, model_override=pin)
     return True
+
+
+def _set_provider_order(src, order, allow_fallbacks=None):
+    """Set the OpenRouter `provider.order` routing for `src` in place.
+
+    `order` is a list of provider names (e.g. ["parasail/fp8", "Together"]); a
+    deliberate, non-empty list pins routing to exactly those providers and —
+    unless `allow_fallbacks` is explicitly True — disables OpenRouter's usual
+    fallback to other upstreams, so you know precisely what's serving the model.
+    Pass `allow_fallbacks=True` to keep falling through the rest of OpenRouter's
+    pool after the ordered list is exhausted. An empty `order` clears routing
+    entirely (sets src.extra_body to None), letting OpenRouter pick freely.
+
+    Only mutates `provider`-style routing; any other keys already in
+    `extra_body` are preserved. Non-routing sources (local llama.cpp, Together,
+    …) accept the field harmlessly — they ignore unknown request-body keys — so
+    this is safe to call on any source, though it only meaningfully routes on
+    OpenRouter."""
+    if order:
+        body = dict(src.extra_body or {})
+        prov = dict(body.get("provider") or {})
+        prov["order"] = list(order)
+        if allow_fallbacks is not None:
+            prov["allow_fallbacks"] = allow_fallbacks
+        else:
+            # Pinning an explicit order means "I chose these specifically" →
+            # don't silently fall through to other providers. The caller can
+            # override by passing allow_fallbacks=True.
+            prov["allow_fallbacks"] = False
+        body["provider"] = prov
+        src.extra_body = body
+    else:
+        src.extra_body = None
+
+
+def _provider_order(src):
+    """The current `provider.order` list on `src`, or [] when unset. Read-only
+    accessor for the /provider listing; never raises."""
+    body = src.extra_body if isinstance(src.extra_body, dict) else None
+    if not body:
+        return []
+    prov = body.get("provider")
+    if not isinstance(prov, dict):
+        return []
+    order = prov.get("order")
+    return list(order) if isinstance(order, list) else []
 
 
 _discover_sources()
@@ -1356,7 +1535,8 @@ def list_dir(path=".", **_):
 def run_bash(command, **_):
     if not _confirm(f"run: {command}"):
         return "DENIED by user"
-    r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
+    timeout = _env_int("MINION_BASH_TIMEOUT", 120)
+    r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
     out = (r.stdout or "") + (r.stderr or "")
     # Big safety slice to bound memory; _sanitize_tool_result applies the real
     # per-result context budget (TOOL_RESULT_CHARS) with dedup.
@@ -1439,7 +1619,7 @@ def _env_float(name, default):
 # (reasoning is broken out into `reasoning_tokens`). Dashboards that want a
 # "total in" sum input + cache_read; a "total out" sum output + reasoning.
 
-def _normalize_usage(usage, timings):
+def _normalize_usage(usage, timings, fallback_chars=0):
     """Pull a {input, output, cache_read, reasoning} token dict out of a
     finished model call, from whichever the server gave us: the standard
     streaming `usage` object (OpenAI/Z.ai) or the llama.cpp `timings` extra
@@ -1455,6 +1635,11 @@ def _normalize_usage(usage, timings):
       output_tokens       completion tokens, MINUS reasoning
       reasoning_tokens    completion_tokens_details.reasoning_tokens, if any
                           (reasoning models: MiniMax-M3, DeepSeek-R1, …)
+
+    When neither `usage` nor `timings` is available, a rough estimate is
+    derived from `fallback_chars` (client-side character count of streamed
+    content + tool-call arguments). This ensures backends like vLLM without
+    `stream_options` support still report token counts to agentdash.
     """
     # llama.cpp: no `usage`, but a `timings` object on the final chunk with
     # prompt_n / predicted_n / cache_n. There's no reasoning split here —
@@ -1470,6 +1655,15 @@ def _normalize_usage(usage, timings):
             "reasoning_tokens": 0,
         }
     if not usage:
+        # Fallback: estimate from client-side character count (~4 chars/token)
+        if fallback_chars > 0:
+            estimated = max(1, fallback_chars // 4)
+            return {
+                "input_tokens": 0,
+                "output_tokens": estimated,
+                "cache_read_tokens": 0,
+                "reasoning_tokens": 0,
+            }
         return None
     prompt_total = int(getattr(usage, "prompt_tokens", 0) or 0)
     completion_total = int(getattr(usage, "completion_tokens", 0) or 0)
@@ -1610,12 +1804,31 @@ def _precise_abbr(n):
     return f"{n / 1_000_000_000:.2f}B"
 
 REASONING_ONLY_CHAR_LIMIT = _env_int("MINION_REASONING_ONLY_CHARS", 36000)
+# In addition to the char limit, cut a reasoning-only stream if it exceeds
+# this many *seconds* of wall-clock time.  The char limit (36K) assumes a
+# healthy generation speed; at slow speeds (6 tok/s on some local models) the
+# model can burn the entire timeout in a single reasoning spiral without ever
+# reaching the char limit.  120s gives ample room for genuine deep thinking
+# while preventing a single reasoning block from eating more than ~2 minutes.
+# Set to 0 to disable the time-based check (char limit only).
+REASONING_ONLY_TIME_LIMIT = _env_int("MINION_REASONING_ONLY_TIME", 120)
+# When a reasoning-only turn stalls, capture the reasoning_content and feed it
+# back to the model as an assistant message so it can *continue* from where it
+# left off rather than starting from scratch.  This caps how many chars of
+# reasoning we store (the rest is truncated to the tail, which usually contains
+# the model's most recent conclusions / draft work).  0 disables capture
+# (reverts to the old behavior: discard reasoning, nudge with no context).
+REASONING_CAPTURE_CHARS = _env_int("MINION_REASONING_CAPTURE_CHARS", 8000)
 MAX_COMPLETION_TOKENS = _env_int("MINION_MAX_TOKENS", 16000)
 # Cap + dedup tool results before they enter the message history. Large,
 # near-duplicate tool outputs (find/ls/grep path dumps) are the fuel for the
 # context-copying repetition collapse some local models fall into — bounding
 # them is the cheapest prevention. 0 disables the size cap (dedup still runs).
 TOOL_RESULT_CHARS = _env_int("MINION_TOOL_RESULT_CHARS", 20000)
+# Backend hint.  Set MINION_BACKEND=vllm to disable llama.cpp-only recovery
+# knobs (min_p, repeat_penalty, DRY) that vLLM's speculative decoder rejects.
+RECOVERY_BACKEND = os.environ.get("MINION_BACKEND", "").strip().lower()
+
 # Recovery sampler. A gibberish/repetition collapse is a LOW-ENTROPY attractor:
 # the model is copying long n-grams already in context (paths, flags). Escaping
 # it needs MORE entropy (raise temperature, lower min_p) plus anti-repetition
@@ -1625,15 +1838,22 @@ TOOL_RESULT_CHARS = _env_int("MINION_TOOL_RESULT_CHARS", 20000)
 # ride in extra_body (llama.cpp reads them; other backends ignore unknown keys).
 RECOVERY_TEMPERATURE = _env_float("MINION_RECOVERY_TEMPERATURE", 1.0)
 RECOVERY_TOP_P = _env_float("MINION_RECOVERY_TOP_P", 0.95)
-RECOVERY_MIN_P = _env_float("MINION_RECOVERY_MIN_P", 0.02)
-RECOVERY_REPEAT_PENALTY = _env_float("MINION_RECOVERY_REPEAT_PENALTY", 1.2)
-RECOVERY_REPEAT_LAST_N = _env_int("MINION_RECOVERY_REPEAT_LAST_N", 512)
-RECOVERY_DRY_MULTIPLIER = _env_float("MINION_RECOVERY_DRY_MULTIPLIER", 0.8)
-RECOVERY_DRY_BASE = _env_float("MINION_RECOVERY_DRY_BASE", 1.75)
-RECOVERY_DRY_ALLOWED_LENGTH = _env_int("MINION_RECOVERY_DRY_ALLOWED_LENGTH", 2)
+RECOVERY_MIN_P = None if RECOVERY_BACKEND == "vllm" else _env_float("MINION_RECOVERY_MIN_P", 0.02)
+RECOVERY_REPEAT_PENALTY = None if RECOVERY_BACKEND == "vllm" else _env_float("MINION_RECOVERY_REPEAT_PENALTY", 1.2)
+RECOVERY_REPEAT_LAST_N = None if RECOVERY_BACKEND == "vllm" else _env_int("MINION_RECOVERY_REPEAT_LAST_N", 512)
+RECOVERY_DRY_MULTIPLIER = None if RECOVERY_BACKEND == "vllm" else _env_float("MINION_RECOVERY_DRY_MULTIPLIER", 0.8)
+RECOVERY_DRY_BASE = None if RECOVERY_BACKEND == "vllm" else _env_float("MINION_RECOVERY_DRY_BASE", 1.75)
+RECOVERY_DRY_ALLOWED_LENGTH = None if RECOVERY_BACKEND == "vllm" else _env_int("MINION_RECOVERY_DRY_ALLOWED_LENGTH", 2)
 # Treat path/code punctuation as DRY sequence breakers so a long file path the
 # agent must emit verbatim is never penalized as "repetition".
-RECOVERY_DRY_SEQUENCE_BREAKERS = ["\n", ":", "\"", "*", "/", "\\", "`", "'"]
+RECOVERY_DRY_SEQUENCE_BREAKERS = None if RECOVERY_BACKEND == "vllm" else ["\n", ":", "\"", "*", "/", "\\", "`", "'"]
+
+# Default sampling params for normal (non-recovery) completions.
+# Set these to get deterministic/greedy output: MINION_TEMPERATURE=0
+# MINION_TOP_P is only relevant when temperature > 0; set to 1 for full
+# probability mass, or lower for nucleus sampling.
+# Set either to a negative value to omit it from the request (let the
+# server use its own default, typically temperature=1.0 / top_p=1.0).
 RISK_CONNECTION_RETRIES = _env_int("MINION_RISK_RETRIES", 3)
 RISK_CONNECTION_RETRY_SECONDS = _env_int("MINION_RISK_RETRY_SECONDS", 1)
 # Resolved here (not at the sessions-section top) because _env_int() is
@@ -1646,7 +1866,7 @@ DESC_SYSTEM = (
     "current task, key files, or goal. No preamble, no quotes, no trailing "
     "punctuation. Write in the same language as the conversation."
 )
-REASONING_ONLY_RETRY_LIMIT = _env_int("MINION_REASONING_ONLY_RETRIES", 1)
+REASONING_ONLY_RETRY_LIMIT = _env_int("MINION_REASONING_ONLY_RETRIES", 3)
 MALFORMED_STREAM_RETRY_LIMIT = _env_int("MINION_MALFORMED_STREAM_RETRIES", 2)
 FORCED_FINAL_MAX_TOKENS = _env_int("MINION_FORCED_FINAL_MAX_TOKENS", 2048)
 # An empty assistant turn (no content, no tool calls) is a silent stall: the model
@@ -1670,6 +1890,19 @@ AUTOCOMPRESS_PERCENT = max(0, min(100, AUTOCOMPRESS_PERCENT))  # clamp 0–100
 # What `/autocompress on` restores; falls back to 85 when configured off.
 AUTOCOMPRESS_DEFAULT = AUTOCOMPRESS_PERCENT or 85
 
+# When the model stalls in reasoning-only (thinks and thinks but never
+# produces a tool call or visible text), the first nudge should push it to
+# ACT — use tools, write code, run commands — rather than to produce a
+# premature "final answer".  This is especially critical for coding-agent
+# tasks where the model must manipulate the filesystem, not narrate.
+# Only on the LAST retry do we ask for a final answer (forced_final=True).
+REASONING_STALL_NUDGE = (
+    "Your previous response was reasoning only — you produced no tool calls and "
+    "no visible output. Stop planning in your head. Act now: emit the next tool "
+    "call or write the file you were thinking about. If you were analyzing the "
+    "problem, pick the most promising approach and execute it. Do not produce a "
+    "final answer unless the task is truly complete."
+)
 FORCED_FINAL_NUDGE = (
     "Your previous streamed response produced reasoning only. Do not continue "
     "private reasoning. Use the final_answer tool if available. Return a complete "
@@ -1843,7 +2076,8 @@ def _assess_risk(action):
                                    "stream": False, "_purpose": "risk",
                                    "_attempt": attempt + 1})
                 resp = client.chat.completions.create(
-                    model=MODEL, messages=payload, stream=False, timeout=15)
+                    model=MODEL, messages=payload, stream=False, timeout=15,
+                    **(ACTIVE.extra_request_kwargs() if ACTIVE else {}))
                 break
             except APIConnectionError:
                 if attempt >= attempts - 1:
@@ -2161,23 +2395,29 @@ def _recovery_sampling_opts():
     repeat_penalty, repeat_last_n and the DRY family are llama.cpp extensions the
     OpenAI SDK won't accept as kwargs, so they ride in extra_body — llama.cpp's
     server merges that into the request body; non-llama.cpp endpoints ignore
-    unknown keys. Set any RECOVERY_* value negative to omit it."""
+    unknown keys. Set any RECOVERY_* value negative to omit it.  When
+    MINION_BACKEND=vllm the llama.cpp-only knobs are set to None instead of
+    their defaults, so the checks below miss them automatically."""
     opts = {}
-    if RECOVERY_TEMPERATURE >= 0:
+    if RECOVERY_TEMPERATURE is not None and RECOVERY_TEMPERATURE >= 0:
         opts["temperature"] = RECOVERY_TEMPERATURE
-    if RECOVERY_TOP_P >= 0:
+    if RECOVERY_TOP_P is not None and RECOVERY_TOP_P >= 0:
         opts["top_p"] = RECOVERY_TOP_P
     extra = {}
-    if RECOVERY_MIN_P >= 0:
+    if RECOVERY_MIN_P is not None and RECOVERY_MIN_P >= 0:
         extra["min_p"] = RECOVERY_MIN_P
-    if RECOVERY_REPEAT_PENALTY >= 0:
+    if RECOVERY_REPEAT_PENALTY is not None and RECOVERY_REPEAT_PENALTY >= 0:
         extra["repeat_penalty"] = RECOVERY_REPEAT_PENALTY
-        extra["repeat_last_n"] = RECOVERY_REPEAT_LAST_N
-    if RECOVERY_DRY_MULTIPLIER > 0:
+        if RECOVERY_REPEAT_LAST_N is not None:
+            extra["repeat_last_n"] = RECOVERY_REPEAT_LAST_N
+    if RECOVERY_DRY_MULTIPLIER is not None and RECOVERY_DRY_MULTIPLIER > 0:
         extra["dry_multiplier"] = RECOVERY_DRY_MULTIPLIER
-        extra["dry_base"] = RECOVERY_DRY_BASE
-        extra["dry_allowed_length"] = RECOVERY_DRY_ALLOWED_LENGTH
-        extra["dry_sequence_breakers"] = RECOVERY_DRY_SEQUENCE_BREAKERS
+        if RECOVERY_DRY_BASE is not None:
+            extra["dry_base"] = RECOVERY_DRY_BASE
+        if RECOVERY_DRY_ALLOWED_LENGTH is not None:
+            extra["dry_allowed_length"] = RECOVERY_DRY_ALLOWED_LENGTH
+        if RECOVERY_DRY_SEQUENCE_BREAKERS is not None:
+            extra["dry_sequence_breakers"] = RECOVERY_DRY_SEQUENCE_BREAKERS
     if extra:
         opts["extra_body"] = extra
     return opts
@@ -2197,6 +2437,11 @@ def open_stream(messages, tools=TOOLS, tool_choice=None, max_tokens=None,
             request_opts.update(_recovery_sampling_opts())
         if tool_choice is not None:
             request_opts["tool_choice"] = tool_choice
+        # Per-request body fields (e.g. OpenRouter provider routing) ride in
+        # extra_body. Merged here once so both the tools and no-tools fallback
+        # branches below carry it through unchanged.
+        if ACTIVE:
+            request_opts.update(ACTIVE.extra_request_kwargs())
         try:
             _log_event("req", {"model": MODEL, "messages": messages, "tools": tools, "stream": True, **request_opts})
             stream = client.chat.completions.create(
@@ -2207,11 +2452,25 @@ def open_stream(messages, tools=TOOLS, tool_choice=None, max_tokens=None,
         except httpx.HTTPError:
             raise  # transport failure — retrying without tools won't help
         except Exception:  # reachable but rejected tools= → text-protocol fallback
-            fallback_opts = {k: v for k, v in request_opts.items() if k != "tool_choice"}
-            _log_event("req", {"model": MODEL, "messages": messages, "stream": True, "_fallback": "no-tools", **fallback_opts})
-            stream = client.chat.completions.create(
-                model=MODEL, messages=messages, stream=True,
-                stream_options={"include_usage": True}, **fallback_opts)
+            # If extra_body (e.g. min_p / repeat_penalty / dry_*) is also
+            # rejected — vLLM's speculative decoder doesn't support min_p etc. —
+            # strip it too.  Try no-tools first, then no-tools + no-extra.
+            for fallback_keys in ({"tool_choice"}, {"tool_choice", "extra_body"}):
+                fallback_opts = {k: v for k, v in request_opts.items()
+                                 if k not in fallback_keys}
+                try:
+                    _tag = "no-tools" if fallback_keys == {"tool_choice"} else "no-tools-no-extra"
+                    _log_event("req", {"model": MODEL, "messages": messages, "stream": True, "_fallback": _tag, **fallback_opts})
+                    stream = client.chat.completions.create(
+                        model=MODEL, messages=messages, stream=True,
+                        stream_options={"include_usage": True}, **fallback_opts)
+                    break  # succeeded
+                except (APIConnectionError, httpx.HTTPError):
+                    raise  # transport failure — don't retry further
+                except Exception:
+                    continue  # try next fallback level
+            else:
+                raise  # all fallbacks exhausted
         # Wrap the stream so every chunk is captured to the log on its way out.
         return _LoggingStream(stream, _llog)
     except (APIConnectionError, httpx.HTTPError):
@@ -2328,7 +2587,9 @@ def compress(messages, keep=COMPRESS_KEEP, auto=False):
     payload = [{"role": "user", "content": summary_prompt}]
     try:
         _log_event("req", {"model": MODEL, "messages": payload, "stream": False, "_purpose": "compress"})
-        resp = client.chat.completions.create(model=MODEL, messages=payload, stream=False)
+        resp = client.chat.completions.create(
+            model=MODEL, messages=payload, stream=False,
+            **(ACTIVE.extra_request_kwargs() if ACTIVE else {}))
         try:
             _log_event("resp", {"_purpose": "compress", "data": resp.model_dump()})
         except Exception:
@@ -2424,6 +2685,7 @@ TURN_DONE = "done"
 TURN_TOOL = "tool"
 TURN_STREAM_CUT = "stream_cut"
 TURN_FORCE_FINAL = "force_final"
+TURN_STALL = "stall"  # reasoning-only stall → nudge to act (full tools retained)
 TURN_EMPTY = "empty"  # assistant emitted no content and no tool calls → silent stall
 TURN_ESC = "esc"  # user pressed Esc at an approval prompt → drop to chat input
 
@@ -2556,11 +2818,14 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     _INTERRUPT_RESTORED.clear()
     _INTERRUPT_ARMED.set()
     content, tcs, mode = [], {}, None
+    reasoning_parts = []  # captured reasoning_content chunks (for stall feedback)
     timings = None
     usage = None
+    streamed_chars = 0    # client-side character count for fallback token estimate
     t_first = None   # time of first output token (for TTFT)
     loop_cut = False
     reasoning_only_chars = 0
+    reasoning_only_start = None  # wall-clock when reasoning-only streaming began
     stream_error = None
     interrupted = False
     finish_reasons = []
@@ -2618,8 +2883,9 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
             # Capture TTFT on the first chunk carrying real output (reasoning,
             # content, or tool calls).
             if t_first is None:
-                rc_peek = getattr(d, "reasoning_content", None) or \
-                          (getattr(d, "model_extra", None) or {}).get("reasoning_content")
+                rc_peek = (getattr(d, "reasoning_content", None) or
+                           (getattr(d, "model_extra", None) or {}).get("reasoning_content") or
+                           (getattr(d, "model_extra", None) or {}).get("reasoning"))
                 if d.content or d.tool_calls or rc_peek:
                     t_first = time.time() - t0
             # llama.cpp attaches a `timings` object to the final chunk — grab it
@@ -2633,19 +2899,44 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
             # so the green "actual response" always lands on its own row (reasoning
             # from the model often doesn't end in \n — without the gap it would
             # run straight into the answer).
-            rc = getattr(d, "reasoning_content", None) or (d.model_extra or {}).get("reasoning_content")
+            rc = (getattr(d, "reasoning_content", None) or
+                  (d.model_extra or {}).get("reasoning_content") or
+                  (d.model_extra or {}).get("reasoning"))
             if rc:
                 if mode != "think":
                     print(f"{DIM}  ── reasoning ──{RESET}")
                     mode = "think"
                 print(f"{DIM}{rc}{RESET}", end="", flush=True)
+                reasoning_parts.append(rc)
                 if not content and not tcs:
                     reasoning_only_chars += len(rc)
+                    if reasoning_only_start is None:
+                        reasoning_only_start = time.time()
+                # Check the char-based limit (fires when reasoning exceeds
+                # REASONING_ONLY_CHAR_LIMIT chars without any content/tool call).
                 if (REASONING_ONLY_CHAR_LIMIT > 0 and not content and not tcs
                         and reasoning_only_chars >= REASONING_ONLY_CHAR_LIMIT):
                     print()
                     print(f"{RED}  ⚠ REASONING-ONLY LIMIT HIT — "
                           f"{_abbr(reasoning_only_chars)} reasoning chars with no "
+                          f"answer/tool call — cutting stream now{RESET}")
+                    loop_cut = True
+                    close = getattr(stream, "close", None)
+                    if close:
+                        close()
+                    break
+                # Check the time-based limit (fires when reasoning-only streaming
+                # has run for > REASONING_ONLY_TIME_LIMIT seconds).  At slow
+                # generation speeds the char limit may never be reached, so this
+                # wall-clock guard prevents a single reasoning spiral from eating
+                # the entire timeout budget.
+                if (REASONING_ONLY_TIME_LIMIT > 0 and not content and not tcs
+                        and reasoning_only_start is not None
+                        and time.time() - reasoning_only_start >= REASONING_ONLY_TIME_LIMIT):
+                    elapsed_reason = time.time() - reasoning_only_start
+                    print()
+                    print(f"{RED}  ⚠ REASONING-ONLY TIME LIMIT — "
+                          f"{elapsed_reason:.0f}s of reasoning with no "
                           f"answer/tool call — cutting stream now{RESET}")
                     loop_cut = True
                     close = getattr(stream, "close", None)
@@ -2663,6 +2954,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                 mode = "say"
                 print(d.content, end="", flush=True)
                 content.append(d.content)
+                streamed_chars += len(d.content)
             for tc in (d.tool_calls or []):
                 # if we were mid-reasoning when tools kicked in, close it out so
                 # the cyan tool box (which starts with its own \n) gets a clean line
@@ -2680,6 +2972,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                     s["name"] = tc.function.name
                 if tc.function and tc.function.arguments:
                     s["args"] += tc.function.arguments
+                    streamed_chars += len(tc.function.arguments)
                 show_tool_status()
     except (APIError, APIConnectionError, httpx.HTTPError) as e:
         stream_error = e
@@ -2757,24 +3050,95 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     if loop_cut:
         retry_limit = max(0, REASONING_ONLY_RETRY_LIMIT)
         cut_count = reasoning_loop_cut_count
-        loop_detail = (
-            f"{_abbr(reasoning_only_chars)} reasoning chars without content/tool calls")
+        reasoning_secs = (time.time() - reasoning_only_start) if reasoning_only_start else 0
+        if reasoning_only_start and REASONING_ONLY_TIME_LIMIT > 0 and \
+                reasoning_secs >= REASONING_ONLY_TIME_LIMIT:
+            loop_detail = (f"{reasoning_secs:.0f}s of reasoning "
+                           f"({_abbr(reasoning_only_chars)} chars) without content/tool calls")
+        else:
+            loop_detail = (
+                f"{_abbr(reasoning_only_chars)} reasoning chars without content/tool calls")
         if forced_final:
             print(f"{RED}  ✂ FORCED FINAL ANSWER FAILED — got {loop_detail}; "
                   f"returning to chat input{RESET}")
             return TURN_DONE
         if cut_count >= retry_limit:
-            print(f"{RED}  ✂ REASONING-ONLY RESCUE FAILED — gave up after "
-                  f"{cut_count} forced final "
-                  f"attempt{'s' if cut_count != 1 else ''} "
-                  f"× {loop_detail}; waiting for user input{RESET}")
+            if retry_limit == 0:
+                # Failsafes deliberately disabled (e.g. benchmark mode where
+                # we let the model think as long as it wants).  The model
+                # produced only reasoning and no action — that's an honest
+                # model-capability signal, not a harness rescue scenario.
+                print(f"{DIM}  • reasoning-only turn ended naturally "
+                      f"({loop_detail}); failsafes disabled, ending turn{RESET}")
+            else:
+                print(f"{RED}  ✂ REASONING-ONLY RESCUE FAILED — gave up after "
+                      f"{cut_count} stall "
+                      f"attempt{'s' if cut_count != 1 else ''} "
+                      f"× {loop_detail}; waiting for user input{RESET}")
             return TURN_DONE
-        cut_msg = (f"{_abbr(reasoning_only_chars)} reasoning chars with no "
-                   f"answer/tool call (limit {_abbr(REASONING_ONLY_CHAR_LIMIT)})")
-        print(f"{YELLOW}  ✂ REASONING-ONLY STALL — {cut_msg}; forcing final answer "
+        if reasoning_only_start and REASONING_ONLY_TIME_LIMIT > 0 and \
+                reasoning_secs >= REASONING_ONLY_TIME_LIMIT:
+            cut_msg = (f"{reasoning_secs:.0f}s of reasoning with no "
+                       f"answer/tool call (limit {REASONING_ONLY_TIME_LIMIT}s)")
+        else:
+            cut_msg = (f"{_abbr(reasoning_only_chars)} reasoning chars with no "
+                       f"answer/tool call (limit {_abbr(REASONING_ONLY_CHAR_LIMIT)})")
+
+        # --- Feed captured reasoning back so the model can *continue* -----
+        # The old behavior discarded reasoning_content entirely and appended a
+        # nudge to the existing user message.  The model saw the same starting
+        # state every time → same reasoning → same stall → literal loop.  Now
+        # we store the reasoning as an assistant message (truncated to a cap so
+        # a 46K-char spiral doesn't blow up context) and add the nudge as a NEW
+        # user message.  The model sees: [task] → [my reasoning] → [now act]
+        # and can pick up where it left off instead of starting from scratch.
+        reasoning_text = "".join(reasoning_parts)
+        if REASONING_CAPTURE_CHARS > 0 and reasoning_text.strip():
+            cap = REASONING_CAPTURE_CHARS
+            if len(reasoning_text) > cap:
+                # Keep the tail — it has the model's most recent conclusions.
+                reasoning_text = ("[…earlier reasoning truncated…]\n"
+                                  + reasoning_text[-cap:])
+            messages.append({"role": "assistant", "content": reasoning_text})
+            print(f"{DIM}  ↳ captured {len(reasoning_text)} chars of reasoning "
+                  f"for feedback{RESET}")
+
+        # Two-tier recovery:
+        #   • First (and any intermediate) stall: nudge the model to ACT —
+        #     emit a tool call, write a file — with FULL tool access. This
+        #     is critical for coding tasks where the model got stuck planning
+        #     but never executed anything.  Returns TURN_STALL so the loop
+        #     retries with normal tools (not the restricted FINAL_ANSWER_TOOL).
+        #   • Last stall (cut_count == retry_limit - 1): force a final answer
+        #     with restricted tools (FINAL_ANSWER_TOOL only).  This is the
+        #     fallback when repeated nudges still don't break the reasoning
+        #     loop, so we at least get a visible answer instead of a hang.
+        is_last_retry = (cut_count == retry_limit - 1)
+        if is_last_retry:
+            print(f"{YELLOW}  ✂ REASONING-ONLY STALL — {cut_msg}; forcing final "
+                  f"answer (attempt {cut_count + 1}/{retry_limit}){RESET}")
+            if reasoning_text.strip():
+                messages.append({"role": "user", "content":
+                    "[Runtime note: Your reasoning has been preserved as your "
+                    "previous message. Do not continue private reasoning. Use "
+                    "the final_answer tool if available, or return a complete "
+                    "visible answer now based on what you reasoned. Keep it "
+                    "concise.]"})
+            else:
+                _nudge_current_user_turn(messages, FORCED_FINAL_NUDGE)
+            return TURN_FORCE_FINAL
+        print(f"{YELLOW}  ✂ REASONING-ONLY STALL — {cut_msg}; nudging to act "
               f"(attempt {cut_count + 1}/{retry_limit}){RESET}")
-        _nudge_current_user_turn(messages, FORCED_FINAL_NUDGE)
-        return TURN_FORCE_FINAL
+        if reasoning_text.strip():
+            messages.append({"role": "user", "content":
+                "[Runtime note: You were thinking about the task above. "
+                "Your reasoning has been preserved as your previous message. "
+                "Now act on it: emit the next tool call, write the file, or "
+                "execute the approach you were planning. Do not reason further "
+                "without taking action.]"})
+        else:
+            _nudge_current_user_turn(messages, REASONING_STALL_NUDGE)
+        return TURN_STALL
 
     # stats footer — prefer llama.cpp timings if present; otherwise fall back
     # to the standard streaming `usage` object (OpenAI, Z.ai, etc.); otherwise
@@ -2782,7 +3146,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     # available — for local it comes from llama.cpp timings, for remote we
     # measure it client-side.
     if _METRICS is not None:
-        _METRICS.add(_normalize_usage(usage, timings))
+        _METRICS.add(_normalize_usage(usage, timings, fallback_chars=streamed_chars))
     if timings and timings.get("predicted_n"):
         prompt_n = timings.get("prompt_n", 0)
         if prompt_n:
@@ -2809,6 +3173,11 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
             parts.append(f"{t_first*1000:4.0f}ms ttft")
         parts.append(f"{elapsed:4.1f}s wall")
         print(f"{DIM}  └ {' · '.join(parts)}{RESET}")
+    elif streamed_chars > 0:
+        gen_n = max(1, streamed_chars // 4)
+        tps = gen_n / elapsed if elapsed > 0 else 0
+        print(f"{DIM}  └ ≈{_abbr(gen_n)} tok · {tps:5.1f} tok/s · "
+              f"{elapsed:4.1f}s wall{RESET}")
     elif text or tcs:
         print(f"{DIM}  └ {elapsed:4.1f}s wall{RESET}")
 
@@ -2955,13 +3324,23 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     return TURN_DONE
 
 
+# Maximum number of model turns (tool calls + retries) per session before the
+# loop breaks.  The real bound on work is the per-task timeout (900-3600s);
+# each turn costs at minimum a few seconds (API round-trip + generation + tool
+# exec), so even 200 turns in a 900s budget means turns averaging <4.5s — that's
+# fast spinning, not productive work.  Individual pathologies (reasoning stalls,
+# empty turns, malformed streams) already have their own retry limits.  This cap
+# is just a total-work backstop so the loop can't run away *inside* the timeout.
+# Overridable via env var.  Set very high (e.g. 99999) to effectively disable.
+MAX_MODEL_TURNS = _env_int("MINION_MAX_MODEL_TURNS", 200)
+
 def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False,
                          on_step=None):
     steps = 0
     reasoning_loop_cuts = 0
     malformed_stream_cuts = 0
     empty_turn_cuts = 0
-    while steps < 25:  # cap runaway tool/retry loops
+    while steps < MAX_MODEL_TURNS:  # cap runaway tool/retry loops
         status = model_turn(messages, reasoning_loop_cuts, malformed_stream_cuts,
                             empty_turn_count=empty_turn_cuts,
                             forced_final=force_final,
@@ -2983,6 +3362,14 @@ def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False,
             empty_turn_cuts += 1
             recovery_sampling = True  # more entropy to escape the empty-output attractor
             continue
+        if status == TURN_STALL:
+            reasoning_loop_cuts += 1
+            recovery_sampling = True
+            # Full tools retained — the model was nudged to ACT (emit a tool
+            # call / write a file) rather than produce a premature final
+            # answer.  force_final stays False so model_turn() opens the
+            # stream with the complete tool set, not [FINAL_ANSWER_TOOL].
+            continue
         if status == TURN_FORCE_FINAL:
             reasoning_loop_cuts += 1
             empty_turn_cuts = 0  # handed off to the forced-final path; reset
@@ -2990,10 +3377,33 @@ def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False,
             recovery_sampling = True
             continue
         if status == TURN_TOOL:
-            reasoning_loop_cuts = 0
+            # A tool call is real progress for malformed-stream and empty-turn
+            # recovery — those counters are about output pathologies, and a
+            # successful tool call means the model is producing again.
+            #
+            # But reasoning_loop_cuts is different: a single trivial tool call
+            # between two 36K-char reasoning spirals does NOT mean the model
+            # has recovered from its tendency to over-think.  Resetting the
+            # counter here lets the model stall → tool → stall → tool → …
+            # forever, and the forced-final-answer safety net (attempt 2/2)
+            # never fires.  In headless mode (benchmarks) this burns the
+            # entire timeout.  Keep the counter so cumulative stalls escalate.
             malformed_stream_cuts = 0
             empty_turn_cuts = 0
             continue
+    # Loop exited because steps >= MAX_MODEL_TURNS.  In interactive mode the
+    # user can simply type another instruction; in headless mode (benchmarks)
+    # the session would end with whatever partial work exists.  Give the model
+    # one last forced-final turn so it can produce a visible answer from the
+    # state so far — but only if we haven't already tried (force_final was
+    # already consumed by the loop above).
+    if steps >= MAX_MODEL_TURNS and not force_final:
+        print(f"{YELLOW}  ⚂ MODEL TURN LIMIT ({MAX_MODEL_TURNS}) — "
+              f"forcing a final answer from current state{RESET}")
+        model_turn(messages, reasoning_loop_cuts, malformed_stream_cuts,
+                   empty_turn_count=empty_turn_cuts,
+                   forced_final=True,
+                   recovery_sampling=recovery_sampling)
 
 
 # --- multi-line chatbox input ---------------------------------------------
@@ -3407,6 +3817,12 @@ def main():
             src_name = data.get("source")
             if src_name:
                 restore_source(src_name, model=data.get("model"))
+                # Re-apply provider routing that was in effect when the session
+                # was saved, so an OpenRouter /provider choice survives a
+                # resume. A saved "provider" list rebuilds the routing object.
+                saved_prov = data.get("provider")
+                if isinstance(saved_prov, list) and ACTIVE and src_name in SOURCES:
+                    _set_provider_order(SOURCES[src_name], saved_prov)
             session_dirty = False  # just loaded — in sync with disk
         elif _resume_requested:
             print(f"{YELLOW}  ✗ no saved session found for {session_id!r}; "
@@ -3456,6 +3872,14 @@ def main():
         m.setdefault("source", ACTIVE.name if ACTIVE else None)
         m.setdefault("cwd", os.getcwd())
         m.setdefault("model", MODEL)
+        # Record the active provider routing (if any) so a /resume re-applies
+        # the same OpenRouter upstream choice. Stored as a bare `order` list
+        # (not the whole extra_body) to keep the session JSON minimal and to
+        # avoid persisting unrelated request-body keys a future feature might add.
+        if ACTIVE:
+            order = _provider_order(ACTIVE)
+            if order:
+                m["provider"] = order
         # Merge cumulative token totals into the session JSON so they persist
         # across restarts and are available to any metrics consumer that reads
         # the session files (e.g. a dashboard). This is always-on — the numbers
@@ -3508,7 +3932,10 @@ def main():
                     else:
                         ctx_s = ""
                         _ensure_ctx_probe(src)  # warm the cache for next time
-                    print(f"  {mark} {CYAN}{sname:<12}{RESET} {DIM}{m} @ {src.base_url}{ctx_s}{RESET}")
+                    # OpenRouter provider routing, if pinned on this source.
+                    prov = _provider_order(src)
+                    prov_s = f" · via {','.join(prov)}" if prov else ""
+                    print(f"  {mark} {CYAN}{sname:<12}{RESET} {DIM}{m} @ {src.base_url}{ctx_s}{prov_s}{RESET}")
                 print(f"{DIM}  /source <name> [model] to switch · "
                       "context preserved (use /reset to clear){RESET}")
             else:
@@ -3541,6 +3968,54 @@ def main():
                 if _METRICS is not None:
                     _METRICS.model = MODEL
                     _METRICS.source = target
+            continue
+        if user == "/provider" or user.startswith("/provider "):
+            # /provider — control OpenRouter upstream-provider routing for the
+            # active source. OpenRouter fronts many providers behind one model
+            # id; routing picks which of them serves the request (different
+            # providers back the same endpoint at different prices / precisions
+            # / latencies). The `provider.order` list rides in the request body
+            # via extra_body (see Source.extra_request_kwargs). This only
+            # meaningfully routes on OpenRouter, but is safe to call on any
+            # source — non-consumers ignore unknown body keys.
+            #
+            #   /provider                       show the active source's routing
+            #   /provider openrouter           show routing for <source>
+            #   /provider parasail/fp8         pin to that provider (active src)
+            #   /provider Together,DeepInfra    ordered: try Together, then DeepInfra
+            #   /provider off                   clear routing (let OpenRouter pick)
+            #   /provider openrouter parasail   set routing on <source>, not active
+            parts = user.split()
+            if len(parts) == 1:
+                # /provider with no args → show the active source's routing.
+                cur = _provider_order(ACTIVE)
+                if cur:
+                    print(f"{DIM}  provider order: {', '.join(cur)}"
+                          f"{RESET} {DIM}(on {ACTIVE.name}){RESET}")
+                else:
+                    print(f"{DIM}  no provider routing set on {ACTIVE.name}"
+                          f"{RESET}")
+                print(f"{DIM}  /provider <a,b,…> to pin · "
+                      "/provider <source> <a,b,…> · /provider off{RESET}")
+                continue
+            arg = parts[1]
+            # /provider <source> [order]  vs  /provider <order>
+            if arg in SOURCES and len(parts) >= 3:
+                target_src = SOURCES[arg]
+                order_str = parts[2]
+            else:
+                target_src = ACTIVE
+                order_str = arg
+            if order_str.lower() in ("off", "none", "clear", ""):
+                _set_provider_order(target_src, [])
+                print(f"{DIM}  ✓ provider routing cleared on "
+                      f"{target_src.name}{RESET}")
+            else:
+                order = [p.strip() for p in order_str.split(",") if p.strip()]
+                _set_provider_order(target_src, order)
+                print(f"{DIM}  ✓ provider order: {', '.join(order)}"
+                      f"  (on {target_src.name}, no fallback){RESET}")
+            session_dirty = True  # routing change is worth persisting
             continue
         if user == "/yolo":
             YOLO = not YOLO

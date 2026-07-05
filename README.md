@@ -44,7 +44,7 @@ Point it at any OpenAI-compatible endpoint — a local llama.cpp / vLLM / SGLang
 remote API like Z.ai or OpenAI itself — and start chatting with an agent that
 can read, write, edit, and run shell commands in your project.
 
-The whole thing is one file (`minion.py`, ~3400 lines). No TUI framework, no
+The whole thing is one file (`minion.py`, ~4600 lines). No TUI framework, no
 plugin system, no config file format. It reads from environment variables (and
 `~/.env`), talks directly to the OpenAI SDK, and uses raw terminal escapes for
 its interface. If you want to understand or modify how it works, you read one
@@ -146,6 +146,27 @@ It's registered last, so it never displaces your default startup source — you
 opt in with `/source together` (or `--source together`). Defining your own
 `MINION_SOURCE_TOGETHER_*` vars overrides the built-in entirely.
 
+#### Built-in `openrouter` source
+
+If `OPENROUTER_API_KEY` is set (in `~/.env` or your shell), minion auto-registers
+an `openrouter` source pointing at `https://openrouter.ai/api/v1`, defaulting to
+the `z-ai/glm-5.2` model routed to the `parasail/fp8` provider (no fallback).
+OpenRouter fronts many providers behind one model id, each with its own price,
+precision, latency, and data-collection policy. Provider routing is controlled
+per-session with the `/provider` command:
+
+```
+/source openrouter                       # → GLM-5.2 via parasail/fp8
+/source openrouter z-ai/glm-4.6          # → any other OpenRouter model id
+/provider Together,DeepInfra              # re-route to specific providers
+/provider off                             # clear routing, let OpenRouter pick
+```
+
+It's registered after `together` (and after all user-defined sources), so it
+never displaces your default startup source — opt in with `/source openrouter`
+(or `--source openrouter`). Defining your own `MINION_SOURCE_OPENROUTER_*` vars
+overrides the built-in entirely.
+
 ### Flags
 
 | flag                          | what it does                                              |
@@ -168,6 +189,10 @@ so per-user settings live in one place instead of being exported every shell.
 | `MINION_SOURCES` / `MINION_SOURCE_*` | named multi-source endpoints |
 | `MINION_ACTIVE` | name of the source to start on (same as `--source`, but persistent; defaults to the first in `MINION_SOURCES`) |
 | `TOGETHER_API_KEY` | auto-registers a built-in `together` source (Together AI, default model `zai-org/GLM-5.2`); override with `MINION_SOURCE_TOGETHER_*` |
+| `OPENROUTER_API_KEY` | auto-registers a built-in `openrouter` source (OpenRouter, default model `z-ai/glm-5.2` routed to `parasail/fp8`); override with `MINION_SOURCE_OPENROUTER_*` |
+| `MINION_BACKEND` | set to `vllm` to disable llama.cpp-only recovery knobs (`min_p`, `repeat_penalty`, DRY) that vLLM's speculative decoder rejects |
+| `MINION_SOURCE_<NAME>_EXTRA_BODY` | JSON object merged into every chat request body for that source (used by OpenRouter's provider routing); invalid JSON is warned to stderr and ignored |
+| `MINION_SOURCE_<NAME>_APP_NAME` / `MINION_SOURCE_<NAME>_APP_URL` | HTTP-Referer / X-Title headers for aggregator identification (OpenRouter dashboard) |
 | `MINION_HOME` / `MINION_SESSIONS_DIR` | where session JSON files are stored |
 | `MINION_MALFORMED_STREAM_RETRIES` | max clean retries for malformed/truncated tool-call args or SSE streams before waiting for user input (default 2) |
 | `MINION_REASONING_ONLY_CHARS` | reasoning-only stall cutoff before forcing a visible answer (default 36000; `0` disables) |
@@ -200,6 +225,7 @@ so per-user settings live in one place instead of being exported every shell.
 | command             | what it does                                            |
 | ------------------- | ------------------------------------------------------ |
 | `/source [name] [model]` | list sources, switch to one, or override its model for that switch (context preserved) |
+| `/provider [source] [a,b,…\|off]` | show or set OpenRouter provider-routing order; `/provider off` clears routing |
 | `/yolo`             | toggle auto-approve for writes and bash                 |
 | `/approval [level]` | show or set risk threshold (`all`/`low`/`medium`/`high`/`yolo`) |
 | `/sessions [n]`     | list recent sessions, or show one in full               |

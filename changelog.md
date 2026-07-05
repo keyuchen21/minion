@@ -2,6 +2,35 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Added — OpenRouter built-in source with provider routing
+
+New built-in `openrouter` source auto-registers when `OPENROUTER_API_KEY` is
+set (mirroring the existing `together` pattern). Unlike Together, OpenRouter
+fronts many upstream providers behind one model id — the `/provider` slash
+command controls which provider(s) serve the request:
+
+- `/provider` show current routing on the active source
+- `/provider parasail/fp8` pin to that provider (no fallback)
+- `/provider Together,DeepInfra` ordered list, fallbacks disabled
+- `/provider off` clear routing, let OpenRouter pick
+- `/provider openrouter parasail` set routing on a named source
+
+New `MINION_SOURCE_<NAME>_EXTRA_BODY` env var (JSON) seeds provider routing and
+any other arbitrary request-body fields. New `MINION_SOURCE_<NAME>_APP_NAME` /
+`MINION_SOURCE_<NAME>_APP_URL` set HTTP-Referer / X-Title headers (used by
+OpenRouter's dashboard). Provider routing is persisted in session JSON and
+re-applied on `/resume`.
+
+### Added — vLLM backend awareness (`MINION_BACKEND=vllm`)
+
+Disables llama.cpp-only recovery knobs (`min_p`, `repeat_penalty`, DRY) that
+vLLM's speculative decoder rejects — omits them from `extra_body` on retries.
+
+### Added — model-turn-limit forced-final safety net
+
+When `MAX_MODEL_TURNS` is reached, the model gets one last forced-final turn so
+headless benchmarks produce a visible answer instead of being cut off mid-stream.
+
 ### Fixed — terminal breaks on resize / broken Enter / garbled typing after model turn
 
 After the interrupt-watcher singleton refactor, resizing the terminal (or

@@ -9,11 +9,12 @@ def clear_minion_env():
     for k in list(os.environ):
         if k.startswith("MINION_"):
             del os.environ[k]
-    # Scrub the built-in `together` source's trigger key so tests that want a
-    # known, minimal source set aren't perturbed by a real ~/.env / shell
-    # export of TOGETHER_API_KEY. (Tests that exercise the together source
-    # set it explicitly.)
+    # Scrub the built-in sources' trigger keys so tests that want a known,
+    # minimal source set aren't perturbed by a real ~/.env / shell export of
+    # TOGETHER_API_KEY / OPENROUTER_API_KEY. (Tests that exercise a built-in
+    # source set it explicitly.)
     os.environ.pop("TOGETHER_API_KEY", None)
+    os.environ.pop("OPENROUTER_API_KEY", None)
     # Prevent ~/.env from leaking real config into the tests. _load_env_file()
     # re-reads it on every reload, so point it at a nonexistent file.
     os.environ["MINION_ENV_FILE"] = "/dev/null"
@@ -176,6 +177,126 @@ assert minion.MODEL == "zai-org/GLM-4.6", "override should pin MODEL"
 # A bare switch afterward falls back to the configured default (non-sticky).
 minion.switch_source("together")
 assert minion.MODEL == "zai-org/GLM-5.2", "bare switch should restore default"
+print("  PASS\n")
+
+# --- Test 13: built-in `openrouter` source auto-registers with a key ---
+clear_minion_env()
+sys.argv = ["minion.py"]
+os.environ["MINION_SOURCE_LOCAL_BASE_URL"] = "http://localhost:8080/v1"
+os.environ["OPENROUTER_API_KEY"] = "fake-or-key"
+importlib.reload(minion)
+print("TEST 13: built-in openrouter source auto-register")
+print(f"  SOURCE_ORDER: {minion.SOURCE_ORDER}")
+or_src = minion.SOURCES.get("openrouter")
+assert or_src is not None, "openrouter source should auto-register with a key"
+assert or_src.base_url == "https://openrouter.ai/api/v1"
+assert or_src.model == "z-ai/glm-5.2", "default model should be z-ai/glm-5.2"
+assert or_src.api_key == "fake-or-key"
+# Default routing pins parasail/fp8 with no fallback.
+assert or_src.extra_body == {"provider": {"order": ["parasail/fp8"],
+                                          "allow_fallbacks": False}}, \
+    f"default routing should pin parasail/fp8, got {or_src.extra_body!r}"
+# Registered last, so the first-defined source stays the startup default.
+assert minion.SOURCE_ORDER[0] == "local"
+assert minion.SOURCE_ORDER[-1] == "openrouter"
+assert minion.ACTIVE.name == "local", "local should remain the default on load"
+print("  PASS\n")
+
+# --- Test 14: no openrouter source without a key ---
+clear_minion_env()
+sys.argv = ["minion.py"]
+os.environ["MINION_SOURCE_LOCAL_BASE_URL"] = "http://localhost:8080/v1"
+importlib.reload(minion)
+print("TEST 14: no openrouter source without OPENROUTER_API_KEY")
+print(f"  SOURCE_ORDER: {minion.SOURCE_ORDER}")
+assert "openrouter" not in minion.SOURCES, "no openrouter source without a key"
+print("  PASS\n")
+
+# --- Test 15: explicit openrouter config overrides the built-in ---
+clear_minion_env()
+sys.argv = ["minion.py"]
+os.environ["MINION_SOURCES"] = "openrouter"
+os.environ["MINION_SOURCE_OPENROUTER_BASE_URL"] = "https://my-or-proxy.example/v1"
+os.environ["MINION_SOURCE_OPENROUTER_API_KEY"] = "custom-or-key"
+os.environ["MINION_SOURCE_OPENROUTER_MODEL"] = "my-org/my-model"
+os.environ["MINION_SOURCE_OPENROUTER_EXTRA_BODY"] = (
+    '{"provider":{"order":["Together"],"allow_fallbacks":true}}')
+os.environ["OPENROUTER_API_KEY"] = "fake-or-key"
+importlib.reload(minion)
+print("TEST 15: explicit openrouter config overrides built-in")
+print(f"  or.base_url: {minion.SOURCES['openrouter'].base_url}")
+print(f"  or.model: {minion.SOURCES['openrouter'].model}")
+assert minion.SOURCES["openrouter"].base_url == "https://my-or-proxy.example/v1"
+assert minion.SOURCES["openrouter"].model == "my-org/my-model"
+assert minion.SOURCES["openrouter"].api_key == "custom-or-key"
+assert minion.SOURCES["openrouter"].extra_body == \
+    {"provider": {"order": ["Together"], "allow_fallbacks": True}}
+print("  PASS\n")
+
+# --- Test 16: bad EXTRA_BODY JSON is ignored loudly (no silent routing) ---
+clear_minion_env()
+sys.argv = ["minion.py"]
+os.environ["MINION_SOURCES"] = "openrouter"
+os.environ["MINION_SOURCE_OPENROUTER_BASE_URL"] = "https://openrouter.ai/api/v1"
+os.environ["MINION_SOURCE_OPENROUTER_API_KEY"] = "k"
+os.environ["MINION_SOURCE_OPENROUTER_MODEL"] = "z-ai/glm-5.2"
+os.environ["MINION_SOURCE_OPENROUTER_EXTRA_BODY"] = "not json{"
+importlib.reload(minion)
+print("TEST 16: bad EXTRA_BODY JSON ignored")
+# Built-in default routing does NOT fill in for a malformed explicit config —
+# a typo must fail loudly (stderr warning) rather than silently route to the
+# default, so extra_body stays None.
+assert minion.SOURCES["openrouter"].extra_body is None, \
+    "malformed EXTRA_BODY should yield no routing, not the built-in default"
+print("  PASS\n")
+
+# --- Test 17: _set_provider_order / _provider_order helpers ---
+clear_minion_env()
+sys.argv = ["minion.py"]
+# Auto-register the built-in openrouter source (the path that seeds the
+# parasail/fp8 default routing). An explicit MINION_SOURCES=openrouter without
+# EXTRA_BODY would NOT inject the default — explicit config means user-control.
+os.environ["MINION_SOURCE_LOCAL_BASE_URL"] = "http://localhost:8080/v1"
+os.environ["OPENROUTER_API_KEY"] = "k"
+importlib.reload(minion)
+print("TEST 17: _set_provider_order / _provider_order")
+src = minion.SOURCES["openrouter"]
+# Starts with the built-in default routing.
+assert minion._provider_order(src) == ["parasail/fp8"]
+# Pin a new ordered list — defaults to no fallback (deliberate choice).
+minion._set_provider_order(src, ["Together", "DeepInfra"])
+assert minion._provider_order(src) == ["Together", "DeepInfra"]
+assert src.extra_body["provider"]["allow_fallbacks"] is False
+# Explicit allow_fallbacks=True is honored.
+minion._set_provider_order(src, ["Together"], allow_fallbacks=True)
+assert src.extra_body["provider"]["allow_fallbacks"] is True
+# Empty order clears routing entirely.
+minion._set_provider_order(src, [])
+assert minion._provider_order(src) == []
+assert src.extra_body is None
+print("  PASS\n")
+
+# --- Test 18: extra_request_kwargs plumbing ---
+clear_minion_env()
+sys.argv = ["minion.py"]
+os.environ["MINION_SOURCE_LOCAL_BASE_URL"] = "http://localhost:8080/v1"
+os.environ["OPENROUTER_API_KEY"] = "k"
+importlib.reload(minion)
+print("TEST 18: extra_request_kwargs plumbing")
+src = minion.SOURCES["openrouter"]
+# Routed source yields an extra_body kwarg.
+kw = src.extra_request_kwargs()
+assert kw == {"extra_body": {"provider": {"order": ["parasail/fp8"],
+                                          "allow_fallbacks": False}}}, kw
+# Clearing routing yields nothing — non-routing sources contribute no kwarg.
+minion._set_provider_order(src, [])
+assert src.extra_request_kwargs() == {}
+# Re-pin and confirm the active source's kwarg matches.
+minion._set_provider_order(src, ["parasail/fp8"])
+minion.switch_source("openrouter")
+assert minion.ACTIVE.extra_request_kwargs() == \
+    {"extra_body": {"provider": {"order": ["parasail/fp8"],
+                                 "allow_fallbacks": False}}}
 print("  PASS\n")
 
 print("=" * 50)
