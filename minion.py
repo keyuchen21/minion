@@ -45,8 +45,8 @@ Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval 
        TOGETHER_API_KEY  (auto-registers a built-in `together` source; default model zai-org/GLM-5.2)
        OPENROUTER_API_KEY  (auto-registers a built-in `openrouter` source; default model z-ai/glm-5.2,
             routed to parasail/fp8 — override with /provider or MINION_SOURCE_OPENROUTER_EXTRA_BODY)
-       MINION_CONTEXT7=1  (enables the lookup_docs tool — fetches up-to-date library docs via Context7
-            MCP server; requires Node.js/npx installed)
+       MINION_CONTEXT7=0  (disables the lookup_docs tool; enabled by default — fetches up-to-date library
+            docs via Context7 MCP server; requires Node.js/npx installed)
 """
 import atexit
 import json
@@ -1678,7 +1678,7 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
 ]
 
-if os.environ.get("MINION_CONTEXT7", "").strip():
+if os.environ.get("MINION_CONTEXT7", "1").strip() != "0":
     DISPATCH["lookup_docs"] = lookup_docs
     TOOLS.append({"type": "function", "function": {
         "name": "lookup_docs",
