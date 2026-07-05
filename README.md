@@ -229,6 +229,7 @@ so per-user settings live in one place instead of being exported every shell.
 | `MINION_ACTIVE` | name of the source to start on (same as `--source`, but persistent; defaults to the first in `MINION_SOURCES`) |
 | `TOGETHER_API_KEY` | auto-registers a built-in `together` source (Together AI, default model `zai-org/GLM-5.2`); override with `MINION_SOURCE_TOGETHER_*` |
 | `OPENROUTER_API_KEY` | auto-registers a built-in `openrouter` source (OpenRouter, default model `z-ai/glm-5.2` routed to `parasail/fp8`); override with `MINION_SOURCE_OPENROUTER_*` |
+| `MINION_CONTEXT7` | set to `1` to enable the `lookup_docs` tool (fetches up-to-date library docs via Context7 MCP server; requires Node.js/npx) |
 | `MINION_BACKEND` | set to `vllm` to disable llama.cpp-only recovery knobs (`min_p`, `repeat_penalty`, DRY) that vLLM's speculative decoder rejects |
 | `MINION_SOURCE_<NAME>_EXTRA_BODY` | JSON object merged into every chat request body for that source (used by OpenRouter's provider routing); invalid JSON is warned to stderr and ignored |
 | `MINION_SOURCE_<NAME>_APP_NAME` / `MINION_SOURCE_<NAME>_APP_URL` | HTTP-Referer / X-Title headers for aggregator identification (OpenRouter dashboard) |

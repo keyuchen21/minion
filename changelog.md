@@ -2,6 +2,18 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Added — Context7 documentation lookup tool
+
+New opt-in `lookup_docs` tool fetches up-to-date library/framework documentation
+via the Context7 MCP server. Enable with `MINION_CONTEXT7=1` (requires Node.js /
+npx). The agent can now call `lookup_docs("react", "hooks")` to get current API
+docs instead of relying on training data.
+
+- Lazily spawns `npx -y @upstash/context7-mcp` on first use, reuses the process
+- Combines resolve-library-id + get-library-docs into a single tool call
+- Zero token overhead when disabled (tool schema not included in requests)
+- Process auto-cleaned on agent exit via atexit
+
 ### Added — OpenRouter built-in source with provider routing
 
 New built-in `openrouter` source auto-registers when `OPENROUTER_API_KEY` is

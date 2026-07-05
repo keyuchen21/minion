@@ -45,7 +45,10 @@ Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval 
        TOGETHER_API_KEY  (auto-registers a built-in `together` source; default model zai-org/GLM-5.2)
        OPENROUTER_API_KEY  (auto-registers a built-in `openrouter` source; default model z-ai/glm-5.2,
             routed to parasail/fp8 — override with /provider or MINION_SOURCE_OPENROUTER_EXTRA_BODY)
+       MINION_CONTEXT7=1  (enables the lookup_docs tool — fetches up-to-date library docs via Context7
+            MCP server; requires Node.js/npx installed)
 """
+import atexit
 import json
 import os
 import random
@@ -1544,6 +1547,119 @@ def run_bash(command, **_):
     return f"[exit {r.returncode}]\n{out[:200000]}"
 
 
+# --- context7 documentation lookup (opt-in via MINION_CONTEXT7=1) -----------
+
+class _Context7:
+    """Minimal MCP client for the Context7 documentation server."""
+
+    def __init__(self):
+        self._proc = None
+        self._id = 0
+
+    def _ensure(self):
+        if self._proc and self._proc.poll() is None:
+            return
+        try:
+            self._proc = subprocess.Popen(
+                ["npx", "-y", "@upstash/context7-mcp"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True)
+        except FileNotFoundError:
+            raise RuntimeError("npx not found — install Node.js to use lookup_docs")
+        self._call("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "minion", "version": "0.1"},
+        })
+        self._notify("notifications/initialized", {})
+
+    def _call(self, method, params):
+        self._id += 1
+        msg = json.dumps({"jsonrpc": "2.0", "id": self._id,
+                          "method": method, "params": params})
+        self._proc.stdin.write(msg + "\n")
+        self._proc.stdin.flush()
+        while True:
+            line = self._proc.stdout.readline()
+            if not line:
+                raise RuntimeError("Context7 process exited unexpectedly")
+            resp = json.loads(line)
+            if "id" in resp:
+                if "error" in resp:
+                    raise RuntimeError(resp["error"].get("message", resp["error"]))
+                return resp.get("result")
+
+    def _notify(self, method, params):
+        msg = json.dumps({"jsonrpc": "2.0", "method": method, "params": params})
+        self._proc.stdin.write(msg + "\n")
+        self._proc.stdin.flush()
+
+    def resolve(self, library):
+        result = self._call("tools/call", {
+            "name": "resolve-library-id",
+            "arguments": {"libraryName": library},
+        })
+        content = result.get("content") or [] if isinstance(result, dict) else []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text", "")
+                if text.strip():
+                    return text.strip()
+        return None
+
+    def get_docs(self, library_id, topic=""):
+        args = {"context7CompatibleLibraryID": library_id}
+        if topic:
+            args["topic"] = topic
+        result = self._call("tools/call", {
+            "name": "get-library-docs",
+            "arguments": args,
+        })
+        content = result.get("content") or [] if isinstance(result, dict) else []
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text", "")
+                if text.strip():
+                    parts.append(text.strip())
+        return "\n\n".join(parts) if parts else None
+
+    def close(self):
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        self._proc = None
+
+
+_ctx7 = None
+
+
+def _ctx7_cleanup():
+    if _ctx7 is not None:
+        _ctx7.close()
+
+
+atexit.register(_ctx7_cleanup)
+
+
+def lookup_docs(library, topic="", **_):
+    """Look up library documentation via Context7 MCP server."""
+    global _ctx7
+    if _ctx7 is None:
+        _ctx7 = _Context7()
+    _ctx7._ensure()
+    lib_id = _ctx7.resolve(library)
+    if not lib_id:
+        return f"No library found matching '{library}'"
+    docs = _ctx7.get_docs(lib_id, topic)
+    if not docs:
+        return f"No documentation found for '{library}' on topic '{topic}'"
+    return f"[Context7: {lib_id}]\n\n{docs}"
+
+
 DISPATCH = {
     "read_file": read_file, "write_file": write_file, "edit_file": edit_file,
     "list_dir": list_dir, "run_bash": run_bash,
@@ -1561,6 +1677,17 @@ TOOLS = [
     {"type": "function", "function": {"name": "run_bash", "description": "Run a shell command",
         "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
 ]
+
+if os.environ.get("MINION_CONTEXT7", "").strip():
+    DISPATCH["lookup_docs"] = lookup_docs
+    TOOLS.append({"type": "function", "function": {
+        "name": "lookup_docs",
+        "description": "Look up current documentation for a library/framework via Context7. Use when you need accurate, up-to-date API docs rather than relying on training data.",
+        "parameters": {"type": "object", "properties": {
+            "library": {"type": "string", "description": "Library name (e.g. 'nextjs', 'react', 'fastapi')"},
+            "topic": {"type": "string", "description": "Specific topic to focus on (e.g. 'routing', 'middleware')"},
+        }, "required": ["library"]},
+    }})
 
 FINAL_ANSWER_TOOL = {"type": "function", "function": {
     "name": "final_answer",
