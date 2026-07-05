@@ -1547,7 +1547,7 @@ def run_bash(command, **_):
     return f"[exit {r.returncode}]\n{out[:200000]}"
 
 
-# --- context7 documentation lookup (opt-in via MINION_CONTEXT7=1) -----------
+# --- context7 documentation lookup (disable with MINION_CONTEXT7=0) ----------
 
 class _Context7:
     """Minimal MCP client for the Context7 documentation server."""
@@ -1594,28 +1594,28 @@ class _Context7:
         self._proc.stdin.write(msg + "\n")
         self._proc.stdin.flush()
 
-    def resolve(self, library):
+    def resolve(self, library, topic=""):
         result = self._call("tools/call", {
             "name": "resolve-library-id",
-            "arguments": {"libraryName": library},
+            "arguments": {"libraryName": library,
+                          "query": topic or library},
         })
-        content = result.get("content") or [] if isinstance(result, dict) else []
+        content = (result.get("content") or []) if isinstance(result, dict) else []
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
                 text = item.get("text", "")
-                if text.strip():
-                    return text.strip()
+                match = re.search(r"Context7-compatible library ID:\s*(\S+)", text)
+                if match:
+                    return match.group(1)
         return None
 
     def get_docs(self, library_id, topic=""):
-        args = {"context7CompatibleLibraryID": library_id}
-        if topic:
-            args["topic"] = topic
         result = self._call("tools/call", {
-            "name": "get-library-docs",
-            "arguments": args,
+            "name": "query-docs",
+            "arguments": {"libraryId": library_id,
+                          "query": topic or "overview"},
         })
-        content = result.get("content") or [] if isinstance(result, dict) else []
+        content = (result.get("content") or []) if isinstance(result, dict) else []
         parts = []
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
@@ -1651,7 +1651,7 @@ def lookup_docs(library, topic="", **_):
     if _ctx7 is None:
         _ctx7 = _Context7()
     _ctx7._ensure()
-    lib_id = _ctx7.resolve(library)
+    lib_id = _ctx7.resolve(library, topic)
     if not lib_id:
         return f"No library found matching '{library}'"
     docs = _ctx7.get_docs(lib_id, topic)
